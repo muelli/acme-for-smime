@@ -1,0 +1,2694 @@
+diff --git a/mail/extensions/acme/acme-tiny/acme_tiny.py b/mail/extensions/acme/acme-tiny/acme_tiny.py
+new file mode 100755
+--- /dev/null
++++ b/mail/extensions/acme/acme-tiny/acme_tiny.py
+@@ -0,0 +1,316 @@
++#!/usr/bin/env python
++# Copyright Daniel Roesler, under MIT license, see LICENSE at github.com/diafygi/acme-tiny
++import argparse, subprocess, json, os, sys, base64, binascii, time, hashlib, re, copy, textwrap, logging, ssl, subprocess, imaplib, email
++import smtplib
++
++# from pip._vendor import requests
++
++try:
++    from urllib.request import urlopen, Request # Python 3
++except ImportError:
++    from urllib2 import urlopen, Request # Python 2
++
++DEFAULT_CA = "https://0.0.0.0:14000" # DEPRECATED! USE DEFAULT_DIRECTORY_URL INSTEAD
++DEFAULT_DIRECTORY_URL = "https://0.0.0.0:14000/dir"
++
++LOGGER = logging.getLogger(__name__)
++LOGGER.addHandler(logging.StreamHandler())
++LOGGER.setLevel(logging.INFO)
++
++def _cmd(cmd_list, stdin=None, cmd_input=None, err_msg="Command Line Error"):
++    proc = subprocess.Popen(cmd_list, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++    out, err = proc.communicate(cmd_input)
++    if proc.returncode != 0:
++        raise IOError("{0}\n{1}".format(err_msg, err))
++    return out
++
++def get_crt(ACMETINYPATH, pemail, pusername, ppassword, phost, pport, psmtpUsername, psmtpPassword, psmtpHost, psmtpPort, account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA, disable_check=False, directory_url=DEFAULT_DIRECTORY_URL, contact=None):
++    directory, acct_headers, alg, jwk = None, None, None, None # global variables
++
++    # helper functions - base64 encode for jose spec
++    def _b64(b):
++        return base64.urlsafe_b64encode(b).decode('utf8').replace("=", "")
++
++    # helper function - run external commands
++    def _cmd(cmd_list, stdin=None, cmd_input=None, err_msg="Command Line Error"):
++        proc = subprocess.Popen(cmd_list, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++        out, err = proc.communicate(cmd_input)
++        if proc.returncode != 0:
++            raise IOError("{0}\n{1}".format(err_msg, err))
++        return out
++
++    # helper function - make request and automatically parse json response
++    def _do_request(url, data=None, err_msg="Error", depth=0):
++        try:
++            resp = urlopen(Request(url, data=data, headers={"Content-Type": "application/jose+json", "User-Agent": "acme-tiny"}), context=ssl._create_unverified_context())
++            resp_data, code, headers = resp.read().decode("utf8"), resp.getcode(), resp.headers
++        except IOError as e:
++            resp_data = e.read().decode("utf8") if hasattr(e, "read") else str(e)
++            code, headers = getattr(e, "code", None), {}
++        try:
++            resp_data = json.loads(resp_data) # try to parse json results
++        except ValueError:
++            pass # ignore json parsing errors
++        if depth < 100 and code == 400 and resp_data['type'] == "urn:ietf:params:acme:error:badNonce":
++            raise IndexError(resp_data) # allow 100 retrys for bad nonces
++        if code not in [200, 201, 204]:
++            raise ValueError("{0}:\nUrl: {1}\nData: {2}\nResponse Code: {3}\nResponse: {4}".format(err_msg, url, data, code, resp_data))
++        return resp_data, code, headers
++
++    # helper function - make signed requests
++    def _send_signed_request(url, payload, err_msg, depth=0):
++        payload64 = "" if payload is None else _b64(json.dumps(payload).encode('utf8'))
++        new_nonce = _do_request(directory['newNonce'])[2]['Replay-Nonce']
++        protected = {"url": url, "alg": alg, "nonce": new_nonce}
++        protected.update({"jwk": jwk} if acct_headers is None else {"kid": acct_headers['Location']})
++        protected64 = _b64(json.dumps(protected).encode('utf8'))
++        protected_input = "{0}.{1}".format(protected64, payload64).encode('utf8')
++        out = _cmd(["openssl", "dgst", "-sha256", "-sign", account_key], stdin=subprocess.PIPE, cmd_input=protected_input, err_msg="OpenSSL Error")
++        data = json.dumps({"protected": protected64, "payload": payload64, "signature": _b64(out)})
++        try:
++            return _do_request(url, data=data.encode('utf8'), err_msg=err_msg, depth=depth)
++        except IndexError: # retry bad nonces (they raise IndexError)
++            return _send_signed_request(url, payload, err_msg, depth=(depth + 1))
++
++    # helper function - poll until complete
++    def _poll_until_not(url, pending_statuses, err_msg):
++        result, t0 = None, time.time()
++        while result is None or result['status'] in pending_statuses:
++            assert (time.time() - t0 < 3600), "Polling timeout" # 1 hour timeout
++            time.sleep(0 if result is None else 2)
++            result, _, _ = _send_signed_request(url, None, err_msg)
++        return result
++
++    # parse account key to get public key
++    log.info("Creating account key...")
++    account_key_value = _cmd(["openssl", "genrsa", "4096"], err_msg="Failed creating account key")
++    f = open(ACMETINYPATH + "resources/account.key", "w")
++    f.write(account_key_value)
++    f.close()
++    log.info("Creating mail key...")
++    mail_key_value = _cmd(["openssl", "genrsa", "4096"], err_msg="Failed creating mail key")
++    f = open(ACMETINYPATH + "resources/mail.key", "w")
++    f.write(mail_key_value)
++    f.close()
++    log.info("Creating mail csr...")
++    csr_value = _cmd(["openssl", "req", "-new", "-sha256", "-key", ACMETINYPATH + "resources/mail.key", "-subj", "/", "-addext", "subjectAltName = email:" + pemail], err_msg="Failed to create csr")
++    f = open(ACMETINYPATH + "resources/tmp/mail.csr", "w")
++    f.write(csr_value)
++    f.close()
++    log.info("Parsing account key...")
++    out = _cmd(["openssl", "rsa", "-in", account_key, "-noout", "-text"], err_msg="OpenSSL Error")
++    pub_pattern = r"modulus:[\s]+?00:([a-f0-9\:\s]+?)\npublicExponent: ([0-9]+)"
++    pub_hex, pub_exp = re.search(pub_pattern, out.decode('utf8'), re.MULTILINE|re.DOTALL).groups()
++    pub_exp = "{0:x}".format(int(pub_exp))
++    pub_exp = "0{0}".format(pub_exp) if len(pub_exp) % 2 else pub_exp
++    alg = "RS256"
++    jwk = {
++        "e": _b64(binascii.unhexlify(pub_exp.encode("utf-8"))),
++        "kty": "RSA",
++        "n": _b64(binascii.unhexlify(re.sub(r"(\s|:)", "", pub_hex).encode("utf-8"))),
++    }
++    accountkey_json = json.dumps(jwk, sort_keys=True, separators=(',', ':'))
++    thumbprint = _b64(hashlib.sha256(accountkey_json.encode('utf8')).digest())
++
++    # find domains
++    log.info("Parsing CSR...")
++    out = _cmd(["openssl", "req", "-in", csr, "-noout", "-text"], err_msg="Error loading {0}".format(csr))
++    domains = set([])
++    common_name = re.search(r"Subject:.*? CN\s?=\s?([^\s,;/]+)", out.decode('utf8'))
++    if common_name is not None:
++        domains.add(common_name.group(1))
++    subject_alt_names = re.search(r"X509v3 Subject Alternative Name: (?:critical)?\n +([^\n]+)\n", out.decode('utf8'), re.MULTILINE|re.DOTALL)
++    if subject_alt_names is not None:
++        for san in subject_alt_names.group(1).split(", "):
++            if san.startswith("email:"):
++                domains.add(san[6:])
++            elif san.startswith("DNS:"):
++                domains.add(san[4:])
++    log.info("Found E-Mail: {0}".format(", ".join(domains)))
++
++    # get the ACME directory of urls
++    log.info("Getting directory...")
++    directory_url = CA + "/directory" if CA != DEFAULT_CA else directory_url # backwards compatibility with deprecated CA kwarg
++    directory, _, _ = _do_request(directory_url, err_msg="Error getting directory")
++    log.info("Directory found!")
++
++    # create account, update contact details (if any), and set the global key identifier
++    log.info("Registering account...")
++    reg_payload = {"termsOfServiceAgreed": True}
++    account, code, acct_headers = _send_signed_request(directory['newAccount'], reg_payload, "Error registering")
++    log.info("Registered!" if code == 201 else "Already registered!")
++    if contact is not None:
++        account, _, _ = _send_signed_request(acct_headers['Location'], {"contact": contact}, "Error updating contact details")
++        log.info("Updated contact details:\n{0}".format("\n".join(account['contact'])))
++
++    # create a new order
++    log.info("Creating new order...")
++    order_payload = {"identifiers": [{"type": "email", "value": d} for d in domains]}
++    order, _, order_headers = _send_signed_request(directory['newOrder'], order_payload, "Error creating new order")
++    log.info("Order created!")
++
++    # get the authorizations that need to be completed
++    for auth_url in order['authorizations']:
++        authorization, _, _ = _send_signed_request(auth_url, None, "Error getting challenges")
++        domain = authorization['identifier']['value']
++        log.info("Verifying {0}...".format(domain))
++
++        # find the http-01 challenge and write the challenge file
++        challenge = [c for c in authorization['challenges'] if c['type'] == "http-01"][0]
++        token = re.sub(r"[^A-Za-z0-9_\-]", "_", challenge['token'])
++        keyauthorization = "{0}.{1}".format(token, thumbprint)
++
++        # check that the file is in place
++        try:
++            wellknown_url = "http://{0}:5002/.well-known/acme-challenge/{1}".format(domain, token)
++            # assert (disable_check or _do_request(wellknown_url)[0] == keyauthorization)
++        except (AssertionError, ValueError) as e:
++            raise ValueError(
++                "Wrote file to {0}, but couldn't download {1}: {2}".format(wellknown_path, wellknown_url, e))
++
++        # say the challenge is done
++        _send_signed_request(challenge['url'], {}, "Error submitting challenges: {0}".format(domain))
++
++        # Get E-Mail token
++        acme_response_address = ""
++        token1 = None
++        token2 = token
++
++        def generate_response_token(t, t2):
++            token = hashlib.sha256((t + t2).encode("utf-8")).digest()
++            et = base64.b64encode(token)
++            ets = str(et)
++            return ets
++
++        def create_response_mail(sender, receiver, token, token1):
++            return """From: """ + sender + """
++To: """ + receiver + """
++Auto-Submitted: auto-generated; type=acme
++Subject: ACME: RE: """ + token1 + """
++Content-Type: text/plain
++MIME-Version: 1.0
++
++-----BEGIN ACME RESPONSE-----
++""" + token + """
++-----END ACME RESPONSE-----
++"""
++
++        while token1 is None:
++            try:
++                imap = imaplib.IMAP4(phost, pport)
++                imap.login(pusername, ppassword)
++                imap.select()
++                status, data = imap.search(None, 'ALL')
++                for num in data[0].split():
++                    status, data = imap.fetch(num, '(RFC822)')
++                    if status:
++                        msg = email.message_from_string(data[0][1])
++                        subject = msg.get("Subject").split("ACME: ")
++                        acme_response_address = msg.get("From")
++                        if len(subject) > 1:
++                            imap.store(num, '+FLAGS', '\\Deleted')
++                            token1 = subject[1]
++                        else:
++                            print("No ACME challenge E-Mail found!")
++                            time.sleep(10)
++                imap.close()
++                imap.logout()
++            except Exception as e:
++                print(str(e))
++
++        print("ACME challenge E-Mail has been found!")
++
++        responseMail = create_response_mail(pemail, acme_response_address, generate_response_token(token1, token2), token1)
++
++        # send E-Mail with merged token
++        try:
++            port = int(psmtpPort)
++            smtpObj = smtplib.SMTP(str(psmtpHost), port)
++            smtpObj.login(psmtpUsername, psmtpPassword)
++            smtpObj.sendmail(pemail, [acme_response_address], responseMail)
++            print("Successfully sent challenge response email!")
++        except smtplib.SMTPException:
++            print("Error: unable to send challenge response email")
++
++
++        wellknown_path = os.path.join(acme_dir, token)
++        with open(wellknown_path, "w") as wellknown_file:
++            wellknown_file.write(keyauthorization)
++
++        authorization = _poll_until_not(auth_url, ["pending"], "Error checking challenge status for {0}".format(domain))
++        if authorization['status'] != "valid":
++            raise ValueError("Challenge did not pass for {0}: {1}".format(domain, authorization))
++        os.remove(wellknown_path)
++        log.info("{0} verified!".format(domain))
++
++    # finalize the order with the csr
++    log.info("Signing certificate...")
++    csr_der = _cmd(["openssl", "req", "-in", csr, "-outform", "DER"], err_msg="DER Export Error")
++    _send_signed_request(order['finalize'], {"csr": _b64(csr_der)}, "Error finalizing order")
++
++    # poll the order to monitor when it's done
++    order = _poll_until_not(order_headers['Location'], ["pending", "processing"], "Error checking order status")
++    if order['status'] != "valid":
++        raise ValueError("Order failed: {0}".format(order))
++
++    # download the certificate
++    certificate_pem, _, _ = _send_signed_request(order['certificate'], None, "Certificate download failed")
++    log.info("Certificate signed!")
++    return certificate_pem
++
++def main(argv=None):
++
++    parser = argparse.ArgumentParser(
++        formatter_class=argparse.RawDescriptionHelpFormatter,
++        description=textwrap.dedent("""\
++            This script automates the process of getting a signed TLS certificate from Let's Encrypt using
++            the ACME protocol. It will need to be run on your server and have access to your private
++            account key, so PLEASE READ THROUGH IT! It's only ~200 lines, so it won't take long.
++
++            Example Usage:
++            python acme_tiny.py --account-key ./account.key --csr ./domain.csr --acme-dir /usr/share/nginx/html/.well-known/acme-challenge/ > signed_chain.crt
++
++            Example Crontab Renewal (once per month):
++            0 0 1 * * python /path/to/acme_tiny.py --account-key /path/to/account.key --csr /path/to/domain.csr --acme-dir /usr/share/nginx/html/.well-known/acme-challenge/ > /path/to/signed_chain.crt 2>> /var/log/acme_tiny.log
++            """)
++    )
++
++    parser.add_argument("--account-key", required=False, default="resources/account.key", help="path to your Let's Encrypt account private key")
++    parser.add_argument("--csr", required=False, default="resources/tmp/mail.csr", help="path to your certificate signing request")
++    parser.add_argument("--acme-dir", required=False, default="html/.well-known/acme-challenge", help="path to the .well-known/acme-challenge/ directory")
++    parser.add_argument("--quiet", action="store_const", const=logging.ERROR, help="suppress output except for errors")
++    parser.add_argument("--disable-check", default=False, action="store_true", help="disable checking if the challenge file is hosted correctly before telling the CA")
++    parser.add_argument("--directory-url", default=DEFAULT_DIRECTORY_URL, help="certificate authority directory url, default is Let's Encrypt")
++    parser.add_argument("--ca", default=DEFAULT_CA, help="DEPRECATED! USE --directory-url INSTEAD!")
++    parser.add_argument("--contact", metavar="CONTACT", default=None, nargs="*", help="Contact details (e.g. mailto:aaa@bbb.com) for your account-key")
++    parser.add_argument("--email", required=False, default=None)
++    parser.add_argument("--username", required=False, default=None)
++    parser.add_argument("--password", required=False, default=None)
++    parser.add_argument("--host", required=False, default=None)
++    parser.add_argument("--port", required=False, default=None)
++    parser.add_argument("--smtpUsername", required=False, default=None)
++    parser.add_argument("--smtpPassword", required=False, default=None)
++    parser.add_argument("--smtpHost", required=False, default=None)
++    parser.add_argument("--smtpPort", required=False, default=None)
++    parser.add_argument("--tinyAcmePath", required=True, default=None)
++
++    args = parser.parse_args(argv)
++    LOGGER.setLevel(args.quiet or LOGGER.level)
++
++    ACMETINYPATH = args.tinyAcmePath
++    signed_crt = get_crt(ACMETINYPATH, args.email, args.username, args.password, args.host, args.port, args.smtpUsername, args.smtpPassword, args.smtpHost, args.smtpPort, ACMETINYPATH + args.account_key, ACMETINYPATH + args.csr, ACMETINYPATH + args.acme_dir, log=LOGGER, CA=args.ca, disable_check=args.disable_check, directory_url=args.directory_url, contact=args.contact)
++
++    file = open(ACMETINYPATH + "resources/output/mail_cert.crt", "w")
++    file.write(signed_crt)
++    file.close()
++
++    out = _cmd(["openssl","pkcs12","-export","-out",ACMETINYPATH + "resources/output/mail_cert.pfx","-passout","pass:test","-inkey",ACMETINYPATH + "resources/mail.key","-in",ACMETINYPATH + "resources/output/mail_cert.crt"], err_msg="PFX creation failed")
++
++    r = requests.get('https://0.0.0.0:15000/roots/0', verify=False)
++    rootCa = open(ACMETINYPATH + "resources/output/root.crt", "w")
++    rootCa.write(r.text)
++    rootCa.close()
++
++
++if __name__ == "__main__": # pragma: no cover
++    main(sys.argv[1:])
+diff --git a/mail/extensions/acme/acme-tiny/html/.well-known/acme-challenge/.gitkeep b/mail/extensions/acme/acme-tiny/html/.well-known/acme-challenge/.gitkeep
+new file mode 100644
+diff --git a/mail/extensions/acme/acme-tiny/html/.well-known/acme-challenge/moz.build b/mail/extensions/acme/acme-tiny/html/.well-known/acme-challenge/moz.build
+new file mode 100644
+--- /dev/null
++++ b/mail/extensions/acme/acme-tiny/html/.well-known/acme-challenge/moz.build
+@@ -0,0 +1,4 @@
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+diff --git a/mail/extensions/acme/acme-tiny/moz.build b/mail/extensions/acme/acme-tiny/moz.build
+new file mode 100644
+--- /dev/null
++++ b/mail/extensions/acme/acme-tiny/moz.build
+@@ -0,0 +1,8 @@
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++DIRS += [
++    'resources'
++]
+\ No newline at end of file
+diff --git a/mail/extensions/acme/acme-tiny/resources/.gitkeep b/mail/extensions/acme/acme-tiny/resources/.gitkeep
+new file mode 100644
+diff --git a/mail/extensions/acme/acme-tiny/resources/moz.build b/mail/extensions/acme/acme-tiny/resources/moz.build
+new file mode 100644
+--- /dev/null
++++ b/mail/extensions/acme/acme-tiny/resources/moz.build
+@@ -0,0 +1,9 @@
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++DIRS += [
++    'output',
++    'tmp'
++]
+\ No newline at end of file
+diff --git a/mail/extensions/acme/acme-tiny/resources/output/.gitkeep b/mail/extensions/acme/acme-tiny/resources/output/.gitkeep
+new file mode 100644
+diff --git a/mail/extensions/acme/acme-tiny/resources/output/moz.build b/mail/extensions/acme/acme-tiny/resources/output/moz.build
+new file mode 100644
+--- /dev/null
++++ b/mail/extensions/acme/acme-tiny/resources/output/moz.build
+@@ -0,0 +1,4 @@
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+diff --git a/mail/extensions/acme/acme-tiny/resources/tmp/.gitkeep b/mail/extensions/acme/acme-tiny/resources/tmp/.gitkeep
+new file mode 100644
+diff --git a/mail/extensions/acme/acme-tiny/resources/tmp/moz.build b/mail/extensions/acme/acme-tiny/resources/tmp/moz.build
+new file mode 100644
+--- /dev/null
++++ b/mail/extensions/acme/acme-tiny/resources/tmp/moz.build
+@@ -0,0 +1,4 @@
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+diff --git a/mail/extensions/acme/acme.js b/mail/extensions/acme/acme.js
+new file mode 100644
+--- /dev/null
++++ b/mail/extensions/acme/acme.js
+@@ -0,0 +1,134 @@
++var _Services = ChromeUtils.import("resource://gre/modules/Services.jsm", null).Services;
++
++var gMessenger = Cc["@mozilla.org/messenger;1"].createInstance(Ci.nsIMessenger);
++
++var { MailServices } = ChromeUtils.import(
++    "resource:///modules/MailServices.jsm"
++);
++
++/**
++ * Returns account details as an array of records.
++ */
++function getAccountDetails(accountKey) {
++
++    for (let account of MailServices.accounts.accounts) {
++        let server = account.incomingServer;
++
++        let acmeForSmimeKey = null;
++        if (account.defaultIdentity != null) {
++            acmeForSmimeKey = account.defaultIdentity.key;
++        }
++
++        if (accountKey === acmeForSmimeKey) {
++            return {
++                key: acmeForSmimeKey,
++                port: server.port,
++                username: server.realUsername,
++                password: server.password,
++                host: server.realHostName,
++                socketType: server.socketType,
++                authMethod: server.authMethod,
++                smtp: _getSMTPDetails(account),
++            };
++        }
++    }
++}
++
++function _getSMTPDetails(aAccount) {
++    for (let identity of aAccount.identities) {
++        let smtpServer = {};
++        MailServices.smtp.getServerByIdentity(identity, smtpServer);
++
++        return {
++            username: smtpServer.value.username,
++            password: smtpServer.value.password,
++            host: smtpServer.value.hostname,
++            port: smtpServer.value.port,
++            authMethod: smtpServer.value.authMethod,
++            socketType: smtpServer.value.socketType,
++        };
++    }
++}
++
++function do_get_file(path, allowNonexistent) {
++    try {
++        let lf = _Services.dirsvc.get("CurProcD", Ci.nsIFile);
++
++        let bits = path.split("/");
++        for (let i = 0; i < bits.length; i++) {
++            if (bits[i]) {
++                if (bits[i] == "..") {
++                    lf = lf.parent;
++                } else {
++                    lf.append(bits[i]);
++                }
++            }
++        }
++
++        if (!allowNonexistent && !lf.exists()) {
++            // Not using do_throw(): caller will continue.
++            _passed = false;
++            var stack = Components.stack.caller;
++            _testLogger.error(
++                "[" +
++                stack.name +
++                " : " +
++                stack.lineNumber +
++                "] " +
++                lf.path +
++                " does not exist"
++            );
++        }
++
++        return lf;
++    } catch (ex) {
++        do_throw(ex.toString(), Components.stack.caller);
++    }
++
++    return null;
++}
++
++let account = window.arguments[0].account;
++let email_addresses_container = document.getElementById('email-addresses');
++let accountDetails = getAccountDetails(account.key);
++
++if(accountDetails.smtp.password === '') {
++    accountDetails.smtp.password = accountDetails.password;
++}
++
++let element = document.createElement("button");
++let acme_tiny_root_path = "chrome/messenger/content/messenger/acme/acme-tiny/";
++
++element.appendChild(document.createTextNode(account.email));
++element.addEventListener("click", function() {
++    let path_to_acme_tiny = do_get_file(acme_tiny_root_path, true).path;
++    path_to_acme_tiny += "/";
++
++    path_to_acme_tiny = "/app/src/acme-tiny/";
++
++    gMessenger.launchTinyAcme(
++        account.email,
++        accountDetails.username,
++        accountDetails.password,
++        accountDetails.host,
++        accountDetails.port,
++        accountDetails.smtp.username,
++        accountDetails.smtp.password,
++        accountDetails.smtp.host,
++        accountDetails.smtp.port,
++        path_to_acme_tiny
++    );
++    let certdb = Cc["@mozilla.org/security/x509certdb;1"].getService(
++        Ci.nsIX509CertDB
++    );
++
++    let certFile = do_get_file(acme_tiny_root_path + "resources/output/mail_cert.pfx");
++    let errorCode = certdb.importPKCS12File(certFile, "test");
++    if(errorCode == 0) {
++        alert("Certificate has been imported! You can select it now!");
++    }
++    else {
++        alert("An error occurred! Error code: " + errorCode);
++    }
++});
++email_addresses_container.appendChild(element);
+diff --git a/mail/extensions/acme/acme.xhtml b/mail/extensions/acme/acme.xhtml
+new file mode 100644
+--- /dev/null
++++ b/mail/extensions/acme/acme.xhtml
+@@ -0,0 +1,23 @@
++<?xml version="1.0"?>
++<?xml-stylesheet href="chrome://global/skin/global.css" type="text/css"?>
++
++<!DOCTYPE window>
++
++<window windowtype="mozilla:acme"
++        xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
++        xmlns:html="http://www.w3.org/1999/xhtml"
++        style="width: 40em; height: 32em;"
++        persist="screenX screenY width height"
++        title="ACME S/MIME">
++
++    <h1>
++        Available E-Mail addresses:
++    </h1>
++    <br></br>
++    <div id="email-addresses">
++
++    </div>
++
++    <script src="chrome://messenger/content/acme/acme.js"/>
++
++</window>
+diff --git a/mail/extensions/acme/jar.mn b/mail/extensions/acme/jar.mn
+new file mode 100644
+--- /dev/null
++++ b/mail/extensions/acme/jar.mn
+@@ -0,0 +1,3 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+diff --git a/mail/extensions/acme/moz.build b/mail/extensions/acme/moz.build
+new file mode 100644
+--- /dev/null
++++ b/mail/extensions/acme/moz.build
+@@ -0,0 +1,10 @@
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++JAR_MANIFESTS += ['jar.mn']
++
++DIRS += [
++    'acme-tiny'
++]
+\ No newline at end of file
+diff --git a/mail/extensions/am-e2e/am-e2e.inc.xhtml b/mail/extensions/am-e2e/am-e2e.inc.xhtml
+--- a/mail/extensions/am-e2e/am-e2e.inc.xhtml
++++ b/mail/extensions/am-e2e/am-e2e.inc.xhtml
+@@ -167,6 +167,8 @@
+                   label="&manageCerts3.label;" accesskey="&manageCerts3.accesskey;"/>
+           <button id="openDeviceManagerButton" oncommand="openDeviceManager();"
+                   label="&manageDevices2.label;" accesskey="&manageDevices2.accesskey;"/>
++          <button id="openAcmeManagerButton" oncommand="openAcmeManager();"
++                  label="ACME S/MIME" accesskey="&manageCerts3.accesskey;"/>
+         </hbox>
+ 
+       </html:fieldset>
+diff --git a/mail/extensions/am-e2e/am-e2e.js b/mail/extensions/am-e2e/am-e2e.js
+--- a/mail/extensions/am-e2e/am-e2e.js
++++ b/mail/extensions/am-e2e/am-e2e.js
+@@ -3,40 +3,19 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-/* import-globals-from ../../../../toolkit/content/preferencesBindings.js */
+-
+-/* global GetEnigmailSvc: false, PgpSqliteDb2: false, EnigGetTempDir: false,
+-          EnigGetLocalFileApi: false, ENIG_LOCAL_FILE_CONTRACTID: false,
+-          EnigFilePicker: false, EnigRevokeKey: false*/
+-
+ var { Services } = ChromeUtils.import("resource://gre/modules/Services.jsm");
+ var { MailConstants } = ChromeUtils.import(
+   "resource:///modules/MailConstants.jsm"
+ );
+-var { MailServices } = ChromeUtils.import(
+-  "resource:///modules/MailServices.jsm"
+-);
++
+ var { BondOpenPGP } = ChromeUtils.import(
+   "chrome://openpgp/content/BondOpenPGP.jsm"
+ );
+-var { EnigmailFiles } = ChromeUtils.import(
+-  "chrome://openpgp/content/modules/files.jsm"
+-);
+ 
+-if (MailConstants.MOZ_OPENPGP && BondOpenPGP.isEnabled()) {
+-  var { RNP } = ChromeUtils.import("chrome://openpgp/content/modules/RNP.jsm");
+-  var { EnigmailKey } = ChromeUtils.import(
+-    "chrome://openpgp/content/modules/key.jsm"
+-  );
++if (MailConstants.MOZ_OPENPGP && BondOpenPGP.allDependenciesLoaded()) {
+   var { EnigmailKeyRing } = ChromeUtils.import(
+     "chrome://openpgp/content/modules/keyRing.jsm"
+   );
+-  var EnigmailCryptoAPI = ChromeUtils.import(
+-    "chrome://openpgp/content/modules/cryptoAPI.jsm"
+-  ).EnigmailCryptoAPI;
+-  var { EnigmailClipboard } = ChromeUtils.import(
+-    "chrome://openpgp/content/modules/clipboard.jsm"
+-  );
+ }
+ 
+ var nsIX509CertDB = Ci.nsIX509CertDB;
+@@ -62,17 +41,13 @@
+ var gSmimePrefbranch;
+ var kEncryptionCertPref = "identity_encryption_cert_name";
+ var kSigningCertPref = "identity_signing_cert_name";
++var kOpenPGPKeyPref = "identity_openpgp_key_id";
+ 
+ var gTechAuto = null;
+ var gTechPrefOpenPGP = null;
+ var gTechPrefSMIME = null;
+ 
+ function onInit() {
+-  if (!MailConstants.MOZ_OPENPGP || !BondOpenPGP.isEnabled()) {
+-    for (let item of document.querySelectorAll(".openpgp-item")) {
+-      item.hidden = true;
+-    }
+-  }
+   e2eInitializeFields();
+ }
+ 
+@@ -91,26 +66,9 @@
+   gBundle = document.getElementById("bundle_e2e");
+   gBrandBundle = document.getElementById("bundle_brand");
+ 
+-  if (MailConstants.MOZ_OPENPGP && BondOpenPGP.isEnabled()) {
+-    document
+-      .getElementById("openPgpKeyListRadio")
+-      .setAttribute(
+-        "preference",
+-        `mail.identity.${gIdentity.key}.openpgp_key_id`
+-      );
+-
+-    if (!Preferences.get(`mail.identity.${gIdentity.key}.openpgp_key_id`)) {
+-      Preferences.add({
+-        id: `mail.identity.${gIdentity.key}.openpgp_key_id`,
+-        type: "string",
+-      });
+-    }
+-
++  if (MailConstants.MOZ_OPENPGP && BondOpenPGP.allDependenciesLoaded()) {
+     gTechChoices = document.getElementById("technologyChoices");
+-    gKeyId = Services.prefs.getStringPref(
+-      `mail.identity.${gIdentity.key}.openpgp_key_id`,
+-      ""
+-    );
++    gKeyId = document.getElementById(kOpenPGPKeyPref);
+     gTechAuto = document.getElementById("technology_automatic");
+     gTechPrefOpenPGP = document.getElementById("technology_prefer_openpgp");
+     gTechPrefSMIME = document.getElementById("technology_prefer_smime");
+@@ -130,12 +88,8 @@
+     gSignCertName.displayName = "";
+     gSignCertName.dbKey = "";
+ 
+-    // If the user doesn't have an identity defined but OpenPGP is available,
+-    // we hide the entire section to avoid issues and edge cases.
+-    if (MailConstants.MOZ_OPENPGP && BondOpenPGP.isEnabled()) {
+-      document
+-        .getElementById("openpgpOptions")
+-        .setAttribute("hidden", "hidden");
++    if (MailConstants.MOZ_OPENPGP && BondOpenPGP.allDependenciesLoaded()) {
++      gKeyId.value = "";
+     }
+ 
+     gRequireEncrypt.disabled = true;
+@@ -144,13 +98,16 @@
+ 
+     gSignMessages.checked = false;
+     gEncryptionChoices.value = 0;
+-    if (MailConstants.MOZ_OPENPGP && BondOpenPGP.isEnabled()) {
++    if (MailConstants.MOZ_OPENPGP && BondOpenPGP.allDependenciesLoaded()) {
+       gTechChoices.value = 0;
+     }
+   } else {
+     var certdb = Cc[nsX509CertDBContractID].getService(nsIX509CertDB);
+     var x509cert = null;
+ 
++    if (MailConstants.MOZ_OPENPGP && BondOpenPGP.allDependenciesLoaded()) {
++      //gKeyId.value = gIdentity.getUnicharAttribute("openpgp_key_id");
++    }
+     gEncryptionCertName.value = gIdentity.getUnicharAttribute(
+       "encryption_cert_name"
+     );
+@@ -173,13 +130,13 @@
+     } catch (e) {}
+ 
+     gEncryptionChoices.value = gIdentity.getIntAttribute("encryptionpolicy");
+-    if (MailConstants.MOZ_OPENPGP && BondOpenPGP.isEnabled()) {
++    if (MailConstants.MOZ_OPENPGP && BondOpenPGP.allDependenciesLoaded()) {
+       gTechChoices.value = gIdentity.getIntAttribute("e2etechpref");
+     }
+ 
+     let enableEnc = !!gEncryptionCertName.value;
+-    if (MailConstants.MOZ_OPENPGP && BondOpenPGP.isEnabled()) {
+-      enableEnc = enableEnc || !!gKeyId;
++    if (MailConstants.MOZ_OPENPGP && BondOpenPGP.allDependenciesLoaded()) {
++      //enableEnc = enableEnc || !!gKeyId.value;
+     }
+ 
+     gRequireEncrypt.disabled = !enableEnc;
+@@ -205,8 +162,8 @@
+     gSignMessages.checked = gIdentity.getBoolAttribute("sign_mail");
+ 
+     let enableSig = gSignCertName.value;
+-    if (MailConstants.MOZ_OPENPGP && BondOpenPGP.isEnabled()) {
+-      enableSig = enableSig || !!gKeyId;
++    if (MailConstants.MOZ_OPENPGP && BondOpenPGP.allDependenciesLoaded()) {
++      //enableSig = enableSig || !!gKeyId.value;
+     }
+ 
+     gSignMessages.disabled = !enableSig;
+@@ -218,45 +175,6 @@
+   // jumps from security panel of one account to another.
+   enableSelectButtons();
+   updateTechPref();
+-
+-  initOpenPgpSettings();
+-}
+-
+-/**
+- * Initialize the OpenPGP settings, apply strings, and load the key radio UI.
+- */
+-async function initOpenPgpSettings() {
+-  if (!MailConstants.MOZ_OPENPGP || !BondOpenPGP.isEnabled()) {
+-    return;
+-  }
+-
+-  let result = {};
+-  await EnigmailKeyRing.getAllSecretKeysByEmail(gIdentity.email, result, true);
+-
+-  let externalKey = gIdentity.getUnicharAttribute(
+-    "last_entered_external_gnupg_key_id"
+-  );
+-
+-  let allKeys = result.all.length + (externalKey ? 1 : 0);
+-
+-  document.l10n.setAttributes(
+-    document.getElementById("openPgpDescription"),
+-    "openpgp-description",
+-    {
+-      count: allKeys,
+-      identity: gIdentity.email,
+-    }
+-  );
+-
+-  // Load the available keys.
+-  reloadOpenPgpUI();
+-  closeNotification();
+-
+-  // Listen for the preference changes.
+-  Preferences.get(`mail.identity.${gIdentity.key}.openpgp_key_id`).on(
+-    "change",
+-    updateOpenPgpSettings
+-  );
+ }
+ 
+ function onPreInit(account, accountValues) {
+@@ -265,21 +183,24 @@
+ 
+ function onSave() {
+   e2eSave();
++  window.dispatchEvent(new CustomEvent("prefchange"));
+ }
+ 
+ function e2eSave() {
+-  // find out which radio for the encryption radio group is selected and set
+-  // that on our hidden encryptionChoice pref.
++  // find out which radio for the encryption radio group is selected and set that on our hidden encryptionChoice pref....
+   var newValue = gEncryptionChoices.value;
+   gHiddenEncryptionPolicy.setAttribute("value", newValue);
+   gIdentity.setIntAttribute("encryptionpolicy", newValue);
+ 
+-  if (MailConstants.MOZ_OPENPGP && BondOpenPGP.isEnabled()) {
++  if (MailConstants.MOZ_OPENPGP && BondOpenPGP.allDependenciesLoaded()) {
+     newValue = gTechChoices.value;
+     gHiddenTechPref.setAttribute("value", newValue);
+     gIdentity.setIntAttribute("e2etechpref", newValue);
+   }
+ 
++  if (MailConstants.MOZ_OPENPGP && BondOpenPGP.allDependenciesLoaded()) {
++    //gIdentity.setUnicharAttribute("openpgp_key_id", gKeyId.value);
++  }
+   gIdentity.setUnicharAttribute(
+     "encryption_cert_name",
+     gEncryptionCertName.displayName || gEncryptionCertName.value
+@@ -376,6 +297,48 @@
+   }
+ }
+ 
++function pgpSelectKey(pgp_key) {
++  if (!MailConstants.MOZ_OPENPGP || !BondOpenPGP.allDependenciesLoaded()) {
++    return;
++  }
++
++  var keyInfo = document.getElementById(pgp_key);
++  if (!keyInfo) {
++    return;
++  }
++
++  let result = {};
++  EnigmailKeyRing.getAllSecretKeysByEmail(gIdentity.email, result);
++
++  let params = {
++    keys: result.all,
++    identity: gIdentity.fullAddress,
++    canceled: true,
++    index: -1,
++  };
++
++  window.docShell.rootTreeItem.domWindow.openDialog(
++    "chrome://openpgp/content/ui/keyPicker.xhtml",
++    "",
++    "dialog,close,titlebar,modal,resizable",
++    params
++  );
++
++  if (params.canceled) {
++    return;
++  }
++
++  keyInfo.value = result.all[params.index].keyId;
++  keyInfo.displayName = result.all[params.index].keyId;
++
++  enableEncryptionControls(true);
++  enableSigningControls(true);
++
++  updateTechPref();
++  enableSelectButtons();
++  onSave();
++}
++
+ function smimeSelectCert(smime_cert) {
+   var certInfo = document.getElementById(smime_cert);
+   if (!certInfo) {
+@@ -496,6 +459,38 @@
+   document.getElementById(
+     "encryptionCertClearButton"
+   ).disabled = !gEncryptionCertName.value;
++
++  if (MailConstants.MOZ_OPENPGP && BondOpenPGP.allDependenciesLoaded()) {
++    //gKeyId.disabled = !gKeyId.value;
++    //document.getElementById("openpgpKeyClearButton").disabled = !gKeyId.value;
++  }
++}
++
++function pgpClearKey(pgp_key) {
++  if (!MailConstants.MOZ_OPENPGP || !BondOpenPGP.allDependenciesLoaded()) {
++    return;
++  }
++  var keyInfo = document.getElementById(pgp_key);
++  if (!keyInfo) {
++    return;
++  }
++
++  keyInfo.disabled = true;
++  keyInfo.value = "";
++
++  let stillHaveOtherSigning = gSignCertName && gSignCertName.value;
++  let stillHaveOtherEncryption =
++    gEncryptionCertName && gEncryptionCertName.value;
++
++  if (!stillHaveOtherEncryption) {
++    enableEncryptionControls(false);
++  }
++  if (!stillHaveOtherSigning) {
++    enableSigningControls(false);
++  }
++  updateTechPref();
++  enableSelectButtons();
++  onSave();
+ }
+ 
+ function smimeClearCert(smime_cert) {
+@@ -510,8 +505,8 @@
+   certInfo.dbKey = "";
+ 
+   let stillHaveOther = false;
+-  if (MailConstants.MOZ_OPENPGP && BondOpenPGP.isEnabled()) {
+-    stillHaveOther = gKeyId != "";
++  if (MailConstants.MOZ_OPENPGP && BondOpenPGP.allDependenciesLoaded()) {
++    //stillHaveOther = gKeyId && gKeyId.value;
+   }
+ 
+   if (!stillHaveOther) {
+@@ -528,13 +523,13 @@
+ }
+ 
+ function updateTechPref() {
+-  if (!MailConstants.MOZ_OPENPGP || !BondOpenPGP.isEnabled()) {
++  if (!MailConstants.MOZ_OPENPGP || !BondOpenPGP.allDependenciesLoaded()) {
+     return;
+   }
+ 
+   let haveSigCert = gSignCertName && gSignCertName.value;
+   let haveEncCert = gEncryptionCertName && gEncryptionCertName.value;
+-  let havePgpkey = !!gKeyId;
++  let havePgpkey = false && gKeyId && gKeyId.value;
+ 
+   let enable = (haveSigCert || haveEncCert) && havePgpkey;
+ 
+@@ -557,947 +552,14 @@
+   parent.gSubDialog.open("chrome://pippki/content/device_manager.xhtml");
+ }
+ 
+-function e2eOnLoadEditor() {
+-  e2eInitializeFields();
+-}
+-
+-/**
+- * Open the OpenPGP Key Manager.
+- */
+-function openKeyManager() {
+-  // Bug 1638153: The rootTreeItem object has been removed after 78. We need to
+-  // the availability of "browsingContext" to use the right DOM window in 79+.
+-  let w =
+-    "browsingContext" in window
+-      ? window.browsingContext.topChromeWindow
+-      : window.docShell.rootTreeItem.domWindow;
+-
+-  let args = {
+-    cancelCallback: reloadOpenPgpUI,
+-    okCallback: reloadOpenPgpUI,
+-  };
+-
+-  w.openDialog(
+-    "chrome://openpgp/content/ui/enigmailKeyManager.xhtml",
+-    "enigmail:KeyManager",
+-    "dialog,centerscreen,resizable",
+-    args
+-  );
+-}
+-
+-/**
+- * Open the subdialog to create or import an OpenPGP key.
+- */
+-function openKeyWizard() {
+-  if (!MailConstants.MOZ_OPENPGP || !BondOpenPGP.isEnabled()) {
+-    return;
+-  }
+-
+-  let args = {
+-    identity: gIdentity,
+-    gSubDialog: parent.gSubDialog,
+-    cancelCallback: reloadOpenPgpUI,
+-    okCallback: keyWizardSuccess,
+-    okImportCallback: keyImportSuccess,
+-    okExternalCallback: keyExternalSuccess,
+-    keyDetailsDialog: enigmailKeyDetails,
+-  };
+-
++function openAcmeManager() {
+   parent.gSubDialog.open(
+-    "chrome://openpgp/content/ui/keyWizard.xhtml",
+-    null,
+-    args
+-  );
+-}
+-
+-/**
+- * Show a succesfull notification after a new OpenPGP key was created, and
+- * trigger the reload of the key listing UI.
+- */
+-async function keyWizardSuccess() {
+-  document.l10n.setAttributes(
+-    document.getElementById("openPgpNotificationDescription"),
+-    "openpgp-keygen-success"
+-  );
+-  document.getElementById("openPgpNotification").collapsed = false;
+-  document.getElementById("openPgpKeyList").collapsed = false;
+-
+-  // Update the global key with the recently generated key that was assigned to
+-  // this identity from the Key generation wizard.
+-  gKeyId = gIdentity.getUnicharAttribute("openpgp_key_id");
+-
+-  reloadOpenPgpUI();
+-}
+-
+-/**
+- * Show a succesfull notification after an import of keys, and trigger the
+- * reload of the key listing UI.
+- */
+-async function keyImportSuccess() {
+-  document.l10n.setAttributes(
+-    document.getElementById("openPgpNotificationDescription"),
+-    "openpgp-keygen-import-success"
+-  );
+-  document.getElementById("openPgpNotification").collapsed = false;
+-  document.getElementById("openPgpKeyList").collapsed = false;
+-
+-  reloadOpenPgpUI();
+-}
+-
+-/**
+- * Show a succesfull notification after an external key was saved, and trigger
+- * the reload of the key listing UI.
+- */
+-async function keyExternalSuccess() {
+-  document.l10n.setAttributes(
+-    document.getElementById("openPgpNotificationDescription"),
+-    "openpgp-keygen-external-success"
+-  );
+-  document.getElementById("openPgpNotification").collapsed = false;
+-  document.getElementById("openPgpKeyList").collapsed = false;
+-
+-  reloadOpenPgpUI();
+-}
+-
+-/**
+- * Collapse the inline notification.
+- */
+-function closeNotification() {
+-  document.getElementById("openPgpNotification").collapsed = true;
+-}
+-
+-/**
+- * Refresh the UI on init or after a successful OpenPGP Key generation.
+- */
+-async function reloadOpenPgpUI() {
+-  let result = {};
+-  await EnigmailKeyRing.getAllSecretKeysByEmail(gIdentity.email, result, true);
+-
+-  let externalKey = gIdentity.getUnicharAttribute(
+-    "last_entered_external_gnupg_key_id"
+-  );
+-
+-  let allKeys =
+-    result.all.length +
+-    (externalKey &&
+-    Services.prefs.getBoolPref("mail.openpgp.allow_external_gnupg")
+-      ? 1
+-      : 0);
+-
+-  // Show the radiogroup container only if the current identity has keys.
+-  document.getElementById("openPgpKeyList").collapsed = !allKeys;
+-
+-  // Update the OpenPGP intro description with the current key count.
+-  document.l10n.setAttributes(
+-    document.getElementById("openPgpDescription"),
+-    "openpgp-description",
+-    {
+-      count: allKeys,
+-      identity: gIdentity.email,
+-    }
+-  );
+-
+-  // Interrupt and udpate the UI accordingly if no Key is associated with the
+-  // current identity.
+-  if (!allKeys) {
+-    gKeyId = null;
+-    updateUIForSelectedOpenPgpKey();
+-    return;
+-  }
+-
+-  let radiogroup = document.getElementById("openPgpKeyListRadio");
+-
+-  // Remove all the previously generated radio options, except the first.
+-  while (radiogroup.lastChild.id != "openPgpOptionNone") {
+-    radiogroup.removeChild(radiogroup.lastChild);
+-  }
+-
+-  // Force deselect the currently selected "None" first index fo the radiogroup.
+-  // This is necessary to allow the selection of the currently used key.
+-  if (gKeyId) {
+-    radiogroup.selectedIndex = -1;
+-  }
+-
+-  // Sort keys by create date from newest to oldest.
+-  result.all.sort((a, b) => {
+-    return b.keyCreated - a.keyCreated;
+-  });
+-
+-  // If the user has an external Key saved, and the pref is TRUE,
+-  // we show it on top of the list.
+-  if (
+-    externalKey &&
+-    Services.prefs.getBoolPref("mail.openpgp.allow_external_gnupg")
+-  ) {
+-    let container = document.createXULElement("vbox");
+-    container.id = `openPgpOption${externalKey}`;
+-    container.classList.add("content-blocking-category");
+-
+-    let box = document.createXULElement("hbox");
+-
+-    let radio = document.createXULElement("radio");
+-    radio.setAttribute("flex", "1");
+-    radio.id = `openPgp${externalKey}`;
+-    radio.value = externalKey;
+-    radio.label = `0x${externalKey}`;
+-
+-    if (externalKey == gIdentity.getUnicharAttribute("openpgp_key_id")) {
+-      radio.setAttribute("selected", "true");
+-    }
+-
+-    let remove = document.createXULElement("button");
+-    document.l10n.setAttributes(remove, "openpgp-key-remove-external");
+-    remove.addEventListener("command", removeExternalKey);
+-    remove.classList.add("button-small");
+-
+-    box.appendChild(radio);
+-    box.appendChild(remove);
+-
+-    let indent = document.createXULElement("vbox");
+-    indent.classList.add("indent");
+-
+-    let dateContainer = document.createXULElement("hbox");
+-    dateContainer.classList.add("expiration-date-container");
+-    dateContainer.setAttribute("align", "center");
+-
+-    let external = document.createXULElement("description");
+-    external.classList.add("external-pill");
+-    document.l10n.setAttributes(external, "key-external-label");
+-
+-    dateContainer.appendChild(external);
+-    indent.appendChild(dateContainer);
+-
+-    container.appendChild(box);
+-    container.appendChild(indent);
+-
+-    radiogroup.appendChild(container);
+-  }
+-
+-  // List all the available keys.
+-  for (let key of result.all) {
+-    let container = document.createXULElement("vbox");
+-    container.id = `openPgpOption${key.keyId}`;
+-    container.classList.add("content-blocking-category");
+-
+-    let box = document.createXULElement("hbox");
+-
+-    let radio = document.createXULElement("radio");
+-    radio.setAttribute("flex", "1");
+-    radio.id = `openPgp${key.keyId}`;
+-    radio.value = key.keyId;
+-    radio.label = `0x${key.keyId}`;
+-
+-    if (key.keyId == gIdentity.getUnicharAttribute("openpgp_key_id")) {
+-      radio.setAttribute("selected", "true");
+-    }
+-
+-    let toggle = document.createXULElement("button");
+-    toggle.classList.add("arrowhead");
+-    toggle.setAttribute("aria-expanded", "false");
+-    document.l10n.setAttributes(toggle, "openpgp-key-expand-section");
+-    toggle.addEventListener("command", toggleExpansion);
+-
+-    box.appendChild(radio);
+-    box.appendChild(toggle);
+-
+-    let indent = document.createXULElement("vbox");
+-    indent.classList.add("indent");
+-
+-    let dateContainer = document.createXULElement("hbox");
+-    dateContainer.classList.add("expiration-date-container");
+-    dateContainer.setAttribute("align", "center");
+-
+-    let dateIcon = document.createXULElement("image");
+-    dateIcon.classList.add("expiration-date-icon");
+-
+-    let dateButton = document.createXULElement("button");
+-    document.l10n.setAttributes(dateButton, "openpgp-key-man-change-expiry");
+-    dateButton.addEventListener("command", () => {
+-      enigmailEditKeyDate(key);
+-    });
+-    dateButton.setAttribute("hidden", "true");
+-    dateButton.classList.add("button-small");
+-
+-    let today = new Date();
+-    today.setMonth(today.getMonth() + 6);
+-
+-    // If the key expires in less than 6 months.
+-    if (
+-      key.expiryTime &&
+-      Math.round(Date.parse(today) / 1000) > key.expiryTime
+-    ) {
+-      dateContainer.classList.add("key-is-expiring");
+-      document.l10n.setAttributes(dateIcon, "openpgp-key-expires-image");
+-      dateButton.removeAttribute("hidden");
+-    }
+-
+-    let fluentExpireKey = "openpgp-radio-key-expires";
+-    // If the key passed its expiration date.
+-    if (key.expiryTime && Math.round(Date.now() / 1000) > key.expiryTime) {
+-      dateContainer.classList.add("key-expired");
+-      fluentExpireKey = "openpgp-radio-key-expired";
+-      document.l10n.setAttributes(dateIcon, "openpgp-key-expired-image");
+-      dateButton.removeAttribute("hidden");
+-
+-      // This key is expired, so make it unselectable.
+-      radio.setAttribute("disabled", "true");
+-    }
+-
+-    let description = document.createXULElement("description");
+-    // If the expiryTime == 0 it means the key doesn't expire.
+-    if (key.expiryTime) {
+-      document.l10n.setAttributes(description, fluentExpireKey, {
+-        date: key.expiry,
+-      });
+-    } else {
+-      document.l10n.setAttributes(description, "key-does-not-expire");
+-    }
+-
+-    dateContainer.appendChild(dateIcon);
+-    dateContainer.appendChild(description);
+-    dateContainer.appendChild(dateButton);
+-
+-    let hiddenContainer = document.createXULElement("vbox");
+-    hiddenContainer.classList.add(
+-      "content-blocking-extra-information",
+-      "indent"
+-    );
+-
+-    // Start key info section.
+-    let grid = document.createXULElement("hbox");
+-    grid.classList.add("extra-information-label");
+-
+-    // Key fingerprint.
+-    let fingerprintImage = document.createXULElement("image");
+-    fingerprintImage.classList.add("content-blocking-openpgp-fingerprint");
+-
+-    let fingerprintLabel = document.createXULElement("label");
+-    document.l10n.setAttributes(
+-      fingerprintLabel,
+-      "openpgp-key-details-fingerprint-label"
+-    );
+-    fingerprintLabel.classList.add("extra-information-label-type");
+-
+-    let fgrInputContainer = document.createXULElement("hbox");
+-    fgrInputContainer.classList.add("input-container");
+-    fgrInputContainer.setAttribute("flex", "1");
+-
+-    let fingerprintInput = document.createElement("input");
+-    fingerprintInput.setAttribute("type", "text");
+-    fingerprintInput.classList.add("plain");
+-    fingerprintInput.setAttribute("readonly", "readonly");
+-    fingerprintInput.value = EnigmailKey.formatFpr(key.fpr);
+-
+-    fgrInputContainer.appendChild(fingerprintInput);
+-
+-    grid.appendChild(fingerprintImage);
+-    grid.appendChild(fingerprintLabel);
+-    grid.appendChild(fgrInputContainer);
+-
+-    // Key creation date.
+-    let createdImage = document.createXULElement("image");
+-    createdImage.classList.add("content-blocking-openpgp-created");
+-
+-    let createdLabel = document.createXULElement("label");
+-    document.l10n.setAttributes(
+-      createdLabel,
+-      "openpgp-key-details-created-header"
+-    );
+-    createdLabel.classList.add("extra-information-label-type");
+-
+-    let createdValueContainer = document.createXULElement("hbox");
+-    createdValueContainer.classList.add("input-container");
+-    createdValueContainer.setAttribute("flex", "1");
+-
+-    let createdValue = document.createElement("input");
+-    createdValue.setAttribute("type", "text");
+-    createdValue.classList.add("plain");
+-    createdValue.setAttribute("readonly", "readonly");
+-    createdValue.value = key.created;
+-
+-    createdValueContainer.appendChild(createdValue);
+-
+-    grid.appendChild(createdImage);
+-    grid.appendChild(createdLabel);
+-    grid.appendChild(createdValueContainer);
+-    // End key info section.
+-
+-    hiddenContainer.appendChild(grid);
+-
+-    // Action buttons.
+-    let btnContainer = document.createXULElement("hbox");
+-    btnContainer.setAttribute("pack", "end");
+-
+-    let info = document.createXULElement("button");
+-    info.classList.add("openpgp-image-btn", "openpgp-props-btn");
+-    document.l10n.setAttributes(info, "openpgp-key-man-key-props");
+-    info.addEventListener("command", () => {
+-      enigmailKeyDetails(key.keyId);
+-    });
+-
+-    let more = document.createXULElement("button");
+-    more.setAttribute("type", "menu");
+-    more.classList.add("openpgp-more-btn", "last-element");
+-    document.l10n.setAttributes(more, "openpgp-key-man-key-more");
+-
+-    let menupopup = document.createXULElement("menupopup");
+-
+-    let copyItem = document.createXULElement("menuitem");
+-    document.l10n.setAttributes(copyItem, "openpgp-key-copy-key");
+-    copyItem.addEventListener("command", () => {
+-      openPgpCopyToClipboard(`0x${key.keyId}`);
+-    });
+-
+-    let sendItem = document.createXULElement("menuitem");
+-    document.l10n.setAttributes(sendItem, "openpgp-key-send-key");
+-    sendItem.addEventListener("command", () => {
+-      openPgpSendKeyEmail(`0x${key.keyId}`);
+-    });
+-
+-    let exportItem = document.createXULElement("menuitem");
+-    document.l10n.setAttributes(exportItem, "openpgp-key-export-key");
+-    exportItem.addEventListener("command", () => {
+-      openPgpExportPublicKey(`0x${key.keyId}`);
+-    });
+-
+-    let backupItem = document.createXULElement("menuitem");
+-    document.l10n.setAttributes(backupItem, "openpgp-key-backup-key");
+-    backupItem.addEventListener("command", () => {
+-      openPgpExportSecretKey(`0x${key.keyId}`, `0x${key.fpr}`);
+-    });
+-
+-    let revokeItem = document.createXULElement("menuitem");
+-    document.l10n.setAttributes(revokeItem, "openpgp-key-man-revoke-key");
+-    revokeItem.addEventListener("command", () => {
+-      openPgpRevokeKey(key);
+-    });
+-
+-    let deleteItem = document.createXULElement("menuitem");
+-    document.l10n.setAttributes(deleteItem, "openpgp-delete-key");
+-    deleteItem.addEventListener("command", () => {
+-      enigmailDeleteKey(key);
+-    });
+-
+-    menupopup.appendChild(copyItem);
+-    menupopup.appendChild(sendItem);
+-    menupopup.appendChild(exportItem);
+-    menupopup.appendChild(document.createXULElement("menuseparator"));
+-    menupopup.appendChild(backupItem);
+-    menupopup.appendChild(document.createXULElement("menuseparator"));
+-    menupopup.appendChild(revokeItem);
+-    menupopup.appendChild(deleteItem);
+-
+-    more.appendChild(menupopup);
+-
+-    btnContainer.appendChild(info);
+-    btnContainer.appendChild(more);
+-
+-    hiddenContainer.appendChild(btnContainer);
+-
+-    indent.appendChild(dateContainer);
+-    indent.appendChild(hiddenContainer);
+-
+-    container.appendChild(box);
+-    container.appendChild(indent);
+-
+-    radiogroup.appendChild(container);
+-  }
+-
+-  updateUIForSelectedOpenPgpKey();
+-}
+-
+-/**
+- * Open the Key Properties subdialog.
+- *
+- * @param {string} keyId - The ID of the selected OpenPGP Key.
+- */
+-function enigmailKeyDetails(keyId) {
+-  keyId = keyId.replace(/^0x/, "");
+-
+-  parent.gSubDialog.open(
+-    "chrome://openpgp/content/ui/keyDetailsDlg.xhtml",
+-    null,
+-    { keyId, modified: onDataModified }
++      "chrome://messenger/content/acme/acme.xhtml",
++      null,
++      {account: gIdentity}
+   );
+ }
+ 
+-/**
+- * Delete an OpenPGP Key.
+- *
+- * @param {Object} key - The selected OpenPGP Key.
+- */
+-async function enigmailDeleteKey(key) {
+-  if (!GetEnigmailSvc()) {
+-    return;
+-  }
+-
+-  // Interrupt if the selected key is currently being used.
+-  if (key.keyId == gIdentity.getUnicharAttribute("openpgp_key_id")) {
+-    let [alertTitle, alertDescription] = await document.l10n.formatValues([
+-      { id: "key-in-use-title" },
+-      { id: "delete-key-in-use-description" },
+-    ]);
+-
+-    Services.prompt.alert(null, alertTitle, alertDescription);
+-    return;
+-  }
+-
+-  let l10nKey = key.secretAvailable ? "delete-secret-key" : "delete-pub-key";
+-  let [title, description] = await document.l10n.formatValues([
+-    { id: "delete-key-title" },
+-    { id: l10nKey, args: { userId: key.userId } },
+-  ]);
+-
+-  // Ask for confirmation before proceeding.
+-  if (!Services.prompt.confirm(null, title, description)) {
+-    return;
+-  }
+-
+-  let cApi = EnigmailCryptoAPI();
+-  cApi.sync(cApi.deleteKey(key.fpr, key.secretAvailable));
+-  cApi.sync(PgpSqliteDb2.deleteAcceptance(key.fpr));
+-
+-  EnigmailKeyRing.clearCache();
+-  reloadOpenPgpUI();
+-}
+-
+-/**
+- * Revoke the selected OpenPGP Key.
+- *
+- * @param {Object} key - The selected OpenPGP Key.
+- */
+-async function openPgpRevokeKey(key) {
+-  // Interrupt if the selected key is currently being used.
+-  if (key.keyId == gIdentity.getUnicharAttribute("openpgp_key_id")) {
+-    let [alertTitle, alertDescription] = await document.l10n.formatValues([
+-      { id: "key-in-use-title" },
+-      { id: "revoke-key-in-use-description" },
+-    ]);
+-
+-    Services.prompt.alert(null, alertTitle, alertDescription);
+-    return;
+-  }
+-
+-  EnigRevokeKey(key, function(success) {
+-    if (success) {
+-      document.l10n.setAttributes(
+-        document.getElementById("openPgpNotificationDescription"),
+-        "openpgp-key-revoke-success"
+-      );
+-      document.getElementById("openPgpNotification").collapsed = false;
+-
+-      EnigmailKeyRing.clearCache();
+-      reloadOpenPgpUI();
+-    }
+-  });
+-}
+-
+-/**
+- * Open the subdialog to enable the user to edit the expiration date of the
+- * selected OpenPGP Key.
+- *
+- * @param {Object} key - The selected OpenPGP Key.
+- */
+-async function enigmailEditKeyDate(key) {
+-  if (!key.iSimpleOneSubkeySameExpiry()) {
+-    Services.prompt.alert(
+-      null,
+-      document.title,
+-      await document.l10n.formatValue("openpgp-cannot-change-expiry")
+-    );
+-    return;
+-  }
+-
+-  let args = {
+-    keyId: key.keyId,
+-    modified: onDataModified,
+-  };
+-
+-  parent.gSubDialog.open(
+-    "chrome://openpgp/content/ui/changeExpiryDlg.xhtml",
+-    null,
+-    args
+-  );
+-}
+-
+-function onDataModified() {
+-  EnigmailKeyRing.clearCache();
+-  reloadOpenPgpUI();
+-}
+-
+-/**
+- * Toggle the visibility of the OpenPgp Key radio container.
+- *
+- * @param {Event} event - The DOM event.
+- */
+-function toggleExpansion(event) {
+-  let carat = event.target;
+-  carat.classList.toggle("up");
+-  carat.closest(".content-blocking-category").classList.toggle("expanded");
+-  carat.setAttribute(
+-    "aria-expanded",
+-    carat.getAttribute("aria-expanded") === "false"
+-  );
+-}
+-
+-/**
+- * Update all the encryption options based on the newly selected OpenPGP Key.
+- */
+-function updateOpenPgpSettings() {
+-  // Get the newly selected OpenPgp Key for this identity.
+-  let newKey = Services.prefs.getStringPref(
+-    `mail.identity.${gIdentity.key}.openpgp_key_id`,
+-    ""
+-  );
+-
+-  // Avoid running the method if the key didn't change.
+-  if (gKeyId == newKey) {
+-    return;
+-  }
+-
+-  // Always update the GnuPG boolean pref to be sure the currently used key is
+-  // internal or external.
+-  gIdentity.setBoolAttribute(
+-    "is_gnupg_key_id",
+-    newKey &&
+-      newKey ==
+-        gIdentity.getUnicharAttribute("last_entered_external_gnupg_key_id")
+-  );
+-
+-  gKeyId = newKey;
+-
+-  if (gKeyId) {
+-    enableEncryptionControls(true);
+-    enableSigningControls(true);
+-  } else {
+-    let stillHaveOtherEncryption =
+-      gEncryptionCertName && gEncryptionCertName.value;
+-    if (!stillHaveOtherEncryption) {
+-      enableEncryptionControls(false);
+-    }
+-
+-    let stillHaveOtherSigning = gSignCertName && gSignCertName.value;
+-    if (!stillHaveOtherSigning) {
+-      enableSigningControls(false);
+-    }
+-  }
+-
+-  updateTechPref();
+-  enableSelectButtons();
+-  onSave();
+-
+-  updateUIForSelectedOpenPgpKey();
+-}
+-
+-/**
+- * Apply a .selected class to the radio container of the currently selected
+- * OpenPGP Key.
+- * Also update UI strings describing the status of current selection.
+- */
+-function updateUIForSelectedOpenPgpKey() {
+-  // Remove a previously selected container, if any.
+-  let current = document.querySelector(".content-blocking-category.selected");
+-
+-  if (current) {
+-    current.classList.remove("selected");
+-  }
+-
+-  // Highlight the parent container of the currently selected radio button.
+-  // The condition needs to be sure the key is not null as a selection of "None"
+-  // returns a value of "".
+-  if (gKeyId !== null) {
+-    let radio = document.querySelector(`radio[value="${gKeyId}"]`);
+-
+-    // If the currently used key was deleted, we might not have the
+-    // corresponding radio element.
+-    if (radio) {
+-      radio.closest(".content-blocking-category").classList.add("selected");
+-    }
+-  }
+-
+-  document.getElementById("openPgpSelectionStatus").hidden = gKeyId === null;
+-  document.getElementById("openPgpLearnMore").hidden = gKeyId === null;
+-
+-  // Reset the image in case of async reload of the list.
+-  let image = document.getElementById("openPgpStatusImage");
+-  image.classList.remove("status-success", "status-error");
+-
+-  let key = EnigmailKeyRing.getKeyById(gKeyId, true);
+-
+-  // Check if the currently selected key has expired.
+-  if (key && key.expiryTime && Math.round(Date.now() / 1000) > key.expiryTime) {
+-    image.classList.add("status-error");
+-    document.l10n.setAttributes(
+-      document.getElementById("openPgpSelectionStatus"),
+-      "openpgp-selection-status-error",
+-      {
+-        key: `0x${gKeyId}`,
+-      }
+-    );
+-  } else {
+-    image.classList.add("status-success");
+-    document.l10n.setAttributes(
+-      document.getElementById("openPgpSelectionStatus"),
+-      "openpgp-selection-status",
+-      {
+-        count: gKeyId ? 1 : 0,
+-        key: `0x${gKeyId}`,
+-      }
+-    );
+-  }
+-
+-  if (gKeyId) {
+-    image.removeAttribute("hidden");
+-  } else {
+-    image.setAttribute("hidden", "true");
+-  }
++function e2eOnLoadEditor() {
++  e2eInitializeFields();
+ }
+-
+-/**
+- * Generic method to copy a string in the user's clipboard.
+- *
+- * @param {string} val - The formatted string to be copied in the clipboard.
+- */
+-function openPgpCopyToClipboard(val) {
+-  let exitCodeObj = {};
+-  let valArray = [val];
+-
+-  let keyData = EnigmailKeyRing.extractKey(0, valArray, null, exitCodeObj, {});
+-
+-  // Alert the user if the copy failed.
+-  if (
+-    exitCodeObj.value !== 0 ||
+-    !EnigmailClipboard.setClipboardContent(keyData)
+-  ) {
+-    document.l10n.formatValue("copy-to-clipbrd-failed").then(value => {
+-      alertUser(value);
+-    });
+-    return;
+-  }
+-
+-  // Let the user know that the copy was successful.
+-  document.l10n.formatValue("copy-to-clipbrd-ok").then(value => {
+-    alertUser(value);
+-  });
+-}
+-
+-/**
+- * Create an attachment with the currently selected OpenPgp public Key and open
+- * a new message compose window.
+- *
+- * @param {string} keyId - The formatted OpenPgp Key ID.
+- */
+-function openPgpSendKeyEmail(keyId) {
+-  let tmpDir = EnigGetTempDir();
+-  let tmpFile;
+-
+-  try {
+-    tmpFile = Cc[ENIG_LOCAL_FILE_CONTRACTID].createInstance(
+-      EnigGetLocalFileApi()
+-    );
+-    tmpFile.initWithPath(tmpDir);
+-  } catch (ex) {
+-    Cu.reportError(ex);
+-    return;
+-  }
+-
+-  tmpFile.append("key.asc");
+-  tmpFile.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
+-
+-  let exitCodeObj = {};
+-  let errorMsgObj = {};
+-  let keyIdArray = [keyId];
+-
+-  EnigmailKeyRing.extractKey(
+-    false,
+-    keyIdArray,
+-    tmpFile,
+-    exitCodeObj,
+-    errorMsgObj
+-  );
+-
+-  if (exitCodeObj.value !== 0) {
+-    alertUser(errorMsgObj.value);
+-    return;
+-  }
+-
+-  // Create the key attachment.
+-  let tmpFileURI = Services.io.newFileURI(tmpFile);
+-  let keyAttachment = Cc[
+-    "@mozilla.org/messengercompose/attachment;1"
+-  ].createInstance(Ci.nsIMsgAttachment);
+-
+-  keyAttachment.url = tmpFileURI.spec;
+-  keyAttachment.name = `${keyId}.asc`;
+-  keyAttachment.temporary = true;
+-  keyAttachment.contentType = "application/pgp-keys";
+-
+-  // Create the new message.
+-  let msgCompFields = Cc[
+-    "@mozilla.org/messengercompose/composefields;1"
+-  ].createInstance(Ci.nsIMsgCompFields);
+-  msgCompFields.addAttachment(keyAttachment);
+-
+-  let msgCompParam = Cc[
+-    "@mozilla.org/messengercompose/composeparams;1"
+-  ].createInstance(Ci.nsIMsgComposeParams);
+-  msgCompParam.composeFields = msgCompFields;
+-  msgCompParam.identity = gIdentity;
+-  msgCompParam.type = Ci.nsIMsgCompType.New;
+-  msgCompParam.format = Ci.nsIMsgCompFormat.Default;
+-  msgCompParam.originalMsgURI = "";
+-
+-  MailServices.compose.OpenComposeWindowWithParams("", msgCompParam);
+-}
+-
+-/**
+- * Export the selected OpenPGP public key to a file.
+- *
+- * @param {string} keyId - The ID of the selected OpenPGP Key.
+- */
+-async function openPgpExportPublicKey(keyId) {
+-  let outFile = EnigmailKeyRing.promptKeyExport2AsciiFilename(
+-    window,
+-    await document.l10n.formatValue("export-to-file"),
+-    `${gIdentity.fullName}_${gIdentity.email}-${keyId}-pub.asc`
+-  );
+-
+-  if (!outFile) {
+-    return;
+-  }
+-
+-  let exitCodeObj = {};
+-  let errorMsgObj = {};
+-  EnigmailKeyRing.extractKey(false, [keyId], outFile, exitCodeObj, errorMsgObj);
+-
+-  // Alert the user if the save process failed.
+-  if (exitCodeObj.value !== 0) {
+-    document.l10n.formatValue("openpgp-export-public-fail").then(value => {
+-      alertUser(value);
+-    });
+-    return;
+-  }
+-
+-  document.l10n.setAttributes(
+-    document.getElementById("openPgpNotificationDescription"),
+-    "openpgp-export-public-success"
+-  );
+-  document.getElementById("openPgpNotification").collapsed = false;
+-}
+-
+-/**
+- * Ask the user to pick a file location and choose a password before proceeding
+- * with the backup of a secret key.
+- *
+- * @param {string} keyId - The ID of the selected OpenPGP Key.
+- * @param {string} keyFpr - The fingerprint of the selected OpenPGP Key.
+- */
+-async function openPgpExportSecretKey(keyId, keyFpr) {
+-  let outFile = EnigmailKeyRing.promptKeyExport2AsciiFilename(
+-    window,
+-    await document.l10n.formatValue("export-keypair-to-file"),
+-    `${gIdentity.fullName}_${gIdentity.email}-${keyId}-secret.asc`
+-  );
+-
+-  if (!outFile) {
+-    return;
+-  }
+-
+-  let args = {
+-    okCallback: exportSecretKey,
+-    file: outFile,
+-    fprArray: [keyFpr],
+-  };
+-
+-  let w;
+-  if ("browsingContext" in window) {
+-    // 79+
+-    w = window.browsingContext.topChromeWindow;
+-  } else {
+-    // 78
+-    w = window.docShell.rootTreeItem.domWindow;
+-  }
+-
+-  w.openDialog(
+-    "chrome://openpgp/content/ui/backupKeyPassword.xhtml",
+-    "",
+-    "dialog,modal,centerscreen,resizable",
+-    args
+-  );
+-}
+-
+-/**
+- * Export the secret key after a successful password setup.
+- *
+- * @param {string} password - The declared password to protect the keys.
+- * @param {Array} fprArray - The array of fingerprint of the selected keys.
+- * @param {Object} file - The file where the keys should be saved.
+- * @param {boolean} confirmed - If the password was properly typed in the prompt.
+- */
+-async function exportSecretKey(password, fprArray, file, confirmed = false) {
+-  // Interrupt in case this method has been called directly without confirming
+-  // the input password through the password prompt.
+-  if (!confirmed) {
+-    return;
+-  }
+-
+-  let backupKeyBlock = await RNP.backupSecretKeys(fprArray, password);
+-
+-  if (
+-    !backupKeyBlock ||
+-    !EnigmailFiles.writeFileContents(
+-      file,
+-      backupKeyBlock,
+-      EnigmailKeyRing.DEFAULT_FILE_PERMS
+-    )
+-  ) {
+-    document.l10n.formatValue("openpgp-export-secret-fail").then(value => {
+-      alertUser(value);
+-    });
+-    return;
+-  }
+-
+-  document.l10n.setAttributes(
+-    document.getElementById("openPgpNotificationDescription"),
+-    "openpgp-export-secret-success"
+-  );
+-  document.getElementById("openPgpNotification").collapsed = false;
+-}
+-
+-/**
+- * Remove the saved external GnuPG Key.
+- */
+-async function removeExternalKey() {
+-  if (!GetEnigmailSvc()) {
+-    return;
+-  }
+-
+-  // Interrupt if the external key is currently being used.
+-  if (
+-    gIdentity.getUnicharAttribute("last_entered_external_gnupg_key_id") ==
+-    gIdentity.getUnicharAttribute("openpgp_key_id")
+-  ) {
+-    let [alertTitle, alertDescription] = await document.l10n.formatValues([
+-      { id: "key-in-use-title" },
+-      { id: "delete-key-in-use-description" },
+-    ]);
+-
+-    Services.prompt.alert(null, alertTitle, alertDescription);
+-    return;
+-  }
+-
+-  let [title, description] = await document.l10n.formatValues([
+-    { id: "delete-external-key-title" },
+-    { id: "delete-external-key-description" },
+-  ]);
+-
+-  // Ask for confirmation before proceeding.
+-  if (!Services.prompt.confirm(null, title, description)) {
+-    return;
+-  }
+-
+-  gIdentity.setBoolAttribute("is_gnupg_key_id", false);
+-  gIdentity.setUnicharAttribute("last_entered_external_gnupg_key_id", "");
+-
+-  reloadOpenPgpUI();
+-}
+diff --git a/mail/extensions/jar.mn b/mail/extensions/jar.mn
+--- a/mail/extensions/jar.mn
++++ b/mail/extensions/jar.mn
+@@ -5,3 +5,10 @@
+ messenger.jar:
+ *  content/messenger/am-e2e.xhtml                                 (am-e2e/am-e2e.xhtml)
+    content/messenger/am-e2e.js                                    (am-e2e/am-e2e.js)
++   content/messenger/acme/acme.xhtml                              (acme/acme.xhtml)
++   content/messenger/acme/acme.js                                 (acme/acme.js)
++   content/messenger/acme/acme-tiny/acme_tiny.py                  (acme/acme-tiny/acme_tiny.py)
++   content/messenger/acme/acme-tiny/resources/.gitkeep            (acme/acme-tiny/resources/.gitkeep)
++   content/messenger/acme/acme-tiny/resources/output/.gitkeep     (acme/acme-tiny/resources/output/.gitkeep)
++   content/messenger/acme/acme-tiny/resources/tmp/.gitkeep        (acme/acme-tiny/resources/tmp/.gitkeep)
++   content/messenger/acme/acme-tiny/html/.well-known/acme-challenge/.gitkeep        (acme/acme-tiny/html/.well-known/acme-challenge/.gitkeep)
+\ No newline at end of file
+diff --git a/mail/extensions/moz.build b/mail/extensions/moz.build
+--- a/mail/extensions/moz.build
++++ b/mail/extensions/moz.build
+@@ -8,6 +8,7 @@
+ DIRS += [
+     'mailviews',
+     'smime',
++    'acme'
+ ]
+ 
+ DIRS += [
+diff --git a/mail/moz.configure b/mail/moz.configure
+--- a/mail/moz.configure
++++ b/mail/moz.configure
+@@ -107,5 +107,5 @@
+ 
+ include('../mailnews/moz.configure')
+ 
+-imply_option('--enable-app-system-headers', True)
++#imply_option('--enable-app-system-headers', True)
+ include('../../toolkit/moz.configure')
+diff --git a/mailnews/base/public/nsIMessenger.idl b/mailnews/base/public/nsIMessenger.idl
+--- a/mailnews/base/public/nsIMessenger.idl
++++ b/mailnews/base/public/nsIMessenger.idl
+@@ -40,6 +40,19 @@
+ 
+     void launchExternalURL(in ACString aURL);
+ 
++    void launchTinyAcme(
++            in string email,
++            in string username,
++            in string password,
++            in string host,
++            in string port,
++            in string smtpUsername,
++            in string smtpPassword,
++            in string smtpHost,
++            in string smtpPort,
++            in string tinyAcmePath
++    );
++
+     boolean canUndo();
+     boolean canRedo();
+     unsigned long getUndoTransactionType();
+diff --git a/mailnews/base/src/nsMessenger.cpp b/mailnews/base/src/nsMessenger.cpp
+--- a/mailnews/base/src/nsMessenger.cpp
++++ b/mailnews/base/src/nsMessenger.cpp
+@@ -104,8 +104,18 @@
+ #include "nsIOutputStream.h"
+ #include "nsIPrincipal.h"
+ 
+-static void ConvertAndSanitizeFileName(const nsACString& displayName,
+-                                       nsString& aResult) {
++#include <iostream>
++#include <cstdlib>
++#include <unistd.h>
++#include <fcntl.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <stdio.h>
++#include <sys/wait.h>
++
++
++static void ConvertAndSanitizeFileName(const nsACString &displayName,
++                                       nsString &aResult) {
+   nsCString unescapedName;
+ 
+   /* we need to convert the UTF-8 fileName to platform specific character set.
+@@ -447,6 +457,105 @@
+   return rv;
+ }
+ 
++NS_IMETHODIMP
++nsMessenger::LaunchTinyAcme(
++        const char *email,
++        const char *username,
++        const char *password,
++        const char *host,
++        const char *port,
++        const char *smtpUsername,
++        const char *smtpPassword,
++        const char *smtpHost,
++        const char *smtpPort,
++        const char *tinyAcmePath
++        )
++{
++    std::string command = std::string("python ") + std::string(tinyAcmePath) + std::string("acme_tiny.py --email ") + std::string(email) + std::string(" --username ") + std::string(username) + std::string(" --password ") + std::string(password) + std::string(" --host ") + std::string(host) + std::string(" --port ") + std::string(port) + std::string(" --smtpUsername ") + std::string(smtpUsername) + std::string(" --smtpPassword ") + std::string(smtpPassword) + std::string(" --smtpHost  ") + std::string(smtpHost)  + std::string(" --smtpPort ") + std::string(smtpPort) + std::string(" --tinyAcmePath ") + std::string(tinyAcmePath);
++    char * emailstring = new char[command.length() + 1];
++    std::strcpy(emailstring, command.c_str());
++    //std::system(emailstring);
++    char concPath[1000];   // array to hold the result.
++
++    strcpy(concPath,tinyAcmePath); // copy string one into the result.
++    strcat(concPath,"acme_tiny.py"); // append string two to the result.
++
++    char* aconcPath = concPath;
++    char aemail[1000];
++    strcpy(aemail,email);
++    char ausername[1000];
++    strcpy(ausername,username);
++    char apassword[1000];
++    strcpy(apassword,password);
++    char ahost[1000];
++    strcpy(ahost,host);
++    char aport[1000];
++    strcpy(aport,port);
++    char asmtpUsername[1000];
++    strcpy(asmtpUsername,smtpUsername);
++    char asmtpPassword[1000];
++    strcpy(asmtpPassword,smtpPassword);
++    char asmtpHost[1000];
++    strcpy(asmtpHost,smtpHost);
++    char asmtpPort[1000];
++    strcpy(asmtpPort,smtpPort);
++    char atinyAcmePath[1000];
++    strcpy(atinyAcmePath,tinyAcmePath);
++
++
++    char* argv[] = {"python",
++                    aconcPath,
++                    "--email",
++                    aemail,
++                    "--username",
++                    ausername,
++                    "--password",
++                    apassword,
++                    "--host",
++                    ahost,
++                    "--port",
++                    aport,
++                    "--smtpUsername",
++                    asmtpUsername,
++                    "--smtpPassword",
++                    asmtpPassword,
++                    "--smtpHost",
++                    asmtpHost,
++                    "--smtpPort",
++                    asmtpPort,
++                    "--tinyAcmePath",
++                    atinyAcmePath,
++                    NULL};
++
++
++    pid_t ch_pid = fork();
++    if (ch_pid == -1) {
++        perror("fork");
++        exit(EXIT_FAILURE);
++    }
++
++    if (ch_pid > 0) {
++        printf("spawn child with pid - %d\n", ch_pid);
++    } else {
++        execvp("python", argv);
++        perror("execve");
++        exit(EXIT_FAILURE);
++    }
++
++
++    pid_t child;
++    int wstatus;
++
++    child = ch_pid;
++
++    if (waitpid(child, &wstatus, WUNTRACED | WCONTINUED) == -1) {
++        perror("waitpid");
++        exit(EXIT_FAILURE);
++    }
++
++    return NS_OK;
++}
++
+ NS_IMETHODIMP nsMessenger::LaunchExternalURL(const nsACString& aURL) {
+   nsresult rv;
+ 
+@@ -1513,13 +1622,13 @@
+ // nsIUrlListener
+ //
+ NS_IMETHODIMP
+-nsSaveMsgListener::OnStartRunningUrl(nsIURI* url) {
++nsSaveMsgListener::OnStartRunningUrl(nsIURI *url) {
+   if (mListener) mListener->OnStartRunningUrl(url);
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+-nsSaveMsgListener::OnStopRunningUrl(nsIURI* url, nsresult exitCode) {
++nsSaveMsgListener::OnStopRunningUrl(nsIURI *url, nsresult exitCode) {
+   nsresult rv = exitCode;
+   mUrlHasStopped = true;
+ 
+@@ -1573,7 +1682,7 @@
+ }
+ 
+ NS_IMETHODIMP
+-nsSaveMsgListener::GetMessageId(nsACString& aMessageId) {
++nsSaveMsgListener::GetMessageId(nsACString &aMessageId) {
+   return NS_ERROR_NOT_IMPLEMENTED;
+ }
+ 
+@@ -1585,7 +1694,7 @@
+ 
+ // initializes the progress window if we are going to show one
+ // and for OSX, sets creator flags on the output file
+-nsresult nsSaveMsgListener::InitializeDownload(nsIRequest* aRequest) {
++nsresult nsSaveMsgListener::InitializeDownload(nsIRequest *aRequest) {
+   nsresult rv = NS_OK;
+ 
+   mInitialized = true;
+@@ -1644,7 +1753,7 @@
+ }
+ 
+ NS_IMETHODIMP
+-nsSaveMsgListener::OnStartRequest(nsIRequest* request) {
++nsSaveMsgListener::OnStartRequest(nsIRequest *request) {
+   if (m_file)
+     MsgNewBufferedFileOutputStream(getter_AddRefs(m_outputStream), m_file, -1,
+                                    ATTACHMENT_PERMISSION);
+@@ -1656,7 +1765,7 @@
+ }
+ 
+ NS_IMETHODIMP
+-nsSaveMsgListener::OnStopRequest(nsIRequest* request, nsresult status) {
++nsSaveMsgListener::OnStopRequest(nsIRequest *request, nsresult status) {
+   nsresult rv = NS_OK;
+   mRequestHasStopped = true;
+ 
+@@ -1690,7 +1799,7 @@
+     m_saveAllAttachmentsState->m_curIndex++;
+     if (!mCanceled && m_saveAllAttachmentsState->m_curIndex <
+                           m_saveAllAttachmentsState->m_count) {
+-      nsSaveAllAttachmentsState* state = m_saveAllAttachmentsState;
++      nsSaveAllAttachmentsState *state = m_saveAllAttachmentsState;
+       uint32_t i = state->m_curIndex;
+       nsString unescapedName;
+       RefPtr<nsLocalFile> localFile =
+@@ -1717,7 +1826,7 @@
+       }
+       rv = m_messenger->SaveAttachment(
+           localFile, state->m_urlArray[i], state->m_messageUriArray[i],
+-          state->m_contentTypeArray[i], (void*)state, nullptr);
++          state->m_contentTypeArray[i], (void *)state, nullptr);
+     done:
+       if (NS_FAILED(rv)) {
+         delete state;
+@@ -1726,7 +1835,7 @@
+     } else {
+       // check if we're saving attachments prior to detaching them.
+       if (m_saveAllAttachmentsState->m_detachingAttachments && !mCanceled) {
+-        nsSaveAllAttachmentsState* state = m_saveAllAttachmentsState;
++        nsSaveAllAttachmentsState *state = m_saveAllAttachmentsState;
+         m_messenger->DetachAttachments(
+             state->m_contentTypeArray, state->m_urlArray,
+             state->m_displayNameArray, state->m_messageUriArray,
+@@ -1756,8 +1865,8 @@
+ }
+ 
+ NS_IMETHODIMP
+-nsSaveMsgListener::OnDataAvailable(nsIRequest* request,
+-                                   nsIInputStream* inStream, uint64_t srcOffset,
++nsSaveMsgListener::OnDataAvailable(nsIRequest *request,
++                                   nsIInputStream *inStream, uint64_t srcOffset,
+                                    uint32_t count) {
+   nsresult rv = NS_ERROR_FAILURE;
+   // first, check to see if we've been canceled....
+@@ -1813,7 +1922,7 @@
+                                       getter_AddRefs(mStringBundle));
+ }
+ 
+-void nsMessenger::GetString(const nsString& aStringName, nsString& aValue) {
++void nsMessenger::GetString(const nsString &aStringName, nsString &aValue) {
+   nsresult rv;
+   aValue.Truncate();
+ 
+@@ -1830,17 +1939,20 @@
+ }
+ 
+ nsSaveAllAttachmentsState::nsSaveAllAttachmentsState(
+-    const nsTArray<nsCString>& contentTypeArray,
+-    const nsTArray<nsCString>& urlArray,
+-    const nsTArray<nsCString>& displayNameArray,
+-    const nsTArray<nsCString>& messageUriArray, const PathChar* dirName,
++    const nsTArray<nsCString> &contentTypeArray,
++    const nsTArray<nsCString> &urlArray,
++    const nsTArray<nsCString> &displayNameArray,
++    const nsTArray<nsCString> &messageUriArray, const PathChar *dirName,
+     bool detachingAttachments)
+-    : m_contentTypeArray(contentTypeArray.Clone()),
+-      m_urlArray(urlArray.Clone()),
+-      m_displayNameArray(displayNameArray.Clone()),
+-      m_messageUriArray(messageUriArray.Clone()),
++    : m_contentTypeArray(contentTypeArray),
++      m_urlArray(urlArray),
++      m_displayNameArray(displayNameArray),
++      m_messageUriArray(messageUriArray),
+       m_detachingAttachments(detachingAttachments),
+       m_withoutWarning(false) {
++  MOZ_ASSERT(contentTypeArray.Length() == urlArray.Length() ==
++             displayNameArray.Length() == messageUriArray.Length());
++
+   m_count = contentTypeArray.Length();
+   m_curIndex = 0;
+   m_directoryName = NS_xstrdup(dirName);
+@@ -1850,7 +1962,7 @@
+   free(m_directoryName);
+ }
+ 
+-nsresult nsMessenger::GetLastSaveDirectory(nsIFile** aLastSaveDir) {
++nsresult nsMessenger::GetLastSaveDirectory(nsIFile **aLastSaveDir) {
+   nsresult rv;
+   nsCOMPtr<nsIPrefBranch> prefBranch =
+       do_GetService(NS_PREFSERVICE_CONTRACTID, &rv);
+@@ -1866,7 +1978,7 @@
+   return rv;
+ }
+ 
+-nsresult nsMessenger::SetLastSaveDirectory(nsIFile* aLocalFile) {
++nsresult nsMessenger::SetLastSaveDirectory(nsIFile *aLocalFile) {
+   NS_ENSURE_ARG_POINTER(aLocalFile);
+   nsresult rv;
+   nsCOMPtr<nsIPrefBranch> prefBranch =
+@@ -1899,7 +2011,7 @@
+  * ACString aMsgUri); */
+ // aPos is relative to the current history cursor - 1 is forward, -1 is back.
+ NS_IMETHODIMP nsMessenger::GetMsgUriAtNavigatePos(int32_t aPos,
+-                                                  nsACString& aMsgUri) {
++                                                  nsACString &aMsgUri) {
+   int32_t desiredArrayIndex = (mCurHistoryPos + (aPos << 1));
+   if (desiredArrayIndex >= 0 &&
+       desiredArrayIndex < (int32_t)mLoadedMsgHistory.Length()) {
+@@ -1918,7 +2030,7 @@
+     return NS_ERROR_INVALID_ARG;
+ }
+ 
+-NS_IMETHODIMP nsMessenger::GetNavigatePos(int32_t* aPos) {
++NS_IMETHODIMP nsMessenger::GetNavigatePos(int32_t *aPos) {
+   NS_ENSURE_ARG_POINTER(aPos);
+   *aPos = mCurHistoryPos >> 1;
+   return NS_OK;
+@@ -1926,7 +2038,7 @@
+ 
+ // aPos is relative to the current history cursor - 1 is forward, -1 is back.
+ NS_IMETHODIMP nsMessenger::GetFolderUriAtNavigatePos(int32_t aPos,
+-                                                     nsACString& aFolderUri) {
++                                                     nsACString &aFolderUri) {
+   int32_t desiredArrayIndex = (mCurHistoryPos + (aPos << 1));
+   if (desiredArrayIndex >= 0 &&
+       desiredArrayIndex < (int32_t)mLoadedMsgHistory.Length()) {
+@@ -1938,24 +2050,24 @@
+ }
+ 
+ NS_IMETHODIMP nsMessenger::GetNavigateHistory(
+-    nsTArray<nsCString>& aHistoryUris) {
+-  aHistoryUris = mLoadedMsgHistory.Clone();
++    nsTArray<nsCString> &aHistoryUris) {
++  aHistoryUris = mLoadedMsgHistory;
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsMessenger::FormatFileSize(uint64_t aSize, bool aUseKB,
+-                            nsAString& aFormattedSize) {
++                            nsAString &aFormattedSize) {
+   return ::FormatFileSize(aSize, aUseKB, aFormattedSize);
+ }
+ 
+-NS_IMETHODIMP nsMessenger::OnItemAdded(nsIMsgFolder* parentItem,
+-                                       nsISupports* item) {
++NS_IMETHODIMP nsMessenger::OnItemAdded(nsIMsgFolder *parentItem,
++                                       nsISupports *item) {
+   return NS_ERROR_NOT_IMPLEMENTED;
+ }
+ 
+-NS_IMETHODIMP nsMessenger::OnItemRemoved(nsIMsgFolder* parentItem,
+-                                         nsISupports* item) {
++NS_IMETHODIMP nsMessenger::OnItemRemoved(nsIMsgFolder *parentItem,
++                                         nsISupports *item) {
+   // check if this item is a message header that's in our history list. If so,
+   // remove it from the history list.
+   nsCOMPtr<nsIMsgDBHdr> msgHdr = do_QueryInterface(item);
+@@ -1967,7 +2079,7 @@
+       nsMsgKey msgKey;
+       msgHdr->GetMessageKey(&msgKey);
+       folder->GenerateMessageURI(msgKey, msgUri);
+-      // need to remove the corresponding folder entry, and
++      // need to remove the correspnding folder entry, and
+       // adjust the current history pos.
+       size_t uriPos = mLoadedMsgHistory.IndexOf(msgUri);
+       if (uriPos != mLoadedMsgHistory.NoIndex) {
+@@ -1980,42 +2092,42 @@
+   return NS_OK;
+ }
+ 
+-NS_IMETHODIMP nsMessenger::OnItemPropertyChanged(nsIMsgFolder* item,
+-                                                 const nsACString& property,
+-                                                 const nsACString& oldValue,
+-                                                 const nsACString& newValue) {
++NS_IMETHODIMP nsMessenger::OnItemPropertyChanged(nsIMsgFolder *item,
++                                                 const nsACString &property,
++                                                 const nsACString &oldValue,
++                                                 const nsACString &newValue) {
+   return NS_ERROR_NOT_IMPLEMENTED;
+ }
+ 
+-NS_IMETHODIMP nsMessenger::OnItemIntPropertyChanged(nsIMsgFolder* item,
+-                                                    const nsACString& property,
++NS_IMETHODIMP nsMessenger::OnItemIntPropertyChanged(nsIMsgFolder *item,
++                                                    const nsACString &property,
+                                                     int64_t oldValue,
+                                                     int64_t newValue) {
+   return NS_ERROR_NOT_IMPLEMENTED;
+ }
+ 
+-NS_IMETHODIMP nsMessenger::OnItemBoolPropertyChanged(nsIMsgFolder* item,
+-                                                     const nsACString& property,
++NS_IMETHODIMP nsMessenger::OnItemBoolPropertyChanged(nsIMsgFolder *item,
++                                                     const nsACString &property,
+                                                      bool oldValue,
+                                                      bool newValue) {
+   return NS_ERROR_NOT_IMPLEMENTED;
+ }
+ 
+ NS_IMETHODIMP nsMessenger::OnItemUnicharPropertyChanged(
+-    nsIMsgFolder* item, const nsACString& property, const nsAString& oldValue,
+-    const nsAString& newValue) {
++    nsIMsgFolder *item, const nsACString &property, const nsAString &oldValue,
++    const nsAString &newValue) {
+   return NS_ERROR_NOT_IMPLEMENTED;
+ }
+ 
+-NS_IMETHODIMP nsMessenger::OnItemPropertyFlagChanged(nsIMsgDBHdr* item,
+-                                                     const nsACString& property,
++NS_IMETHODIMP nsMessenger::OnItemPropertyFlagChanged(nsIMsgDBHdr *item,
++                                                     const nsACString &property,
+                                                      uint32_t oldFlag,
+                                                      uint32_t newFlag) {
+   return NS_ERROR_NOT_IMPLEMENTED;
+ }
+ 
+-NS_IMETHODIMP nsMessenger::OnItemEvent(nsIMsgFolder* item,
+-                                       const nsACString& event) {
++NS_IMETHODIMP nsMessenger::OnItemEvent(nsIMsgFolder *item,
++                                       const nsACString &event) {
+   return NS_ERROR_NOT_IMPLEMENTED;
+ }
+ 
+@@ -2023,14 +2135,14 @@
+ // Detach/Delete Attachments
+ ///////////////////////////////////////////////////////////////////////////////
+ 
+-static const char* GetAttachmentPartId(const char* aAttachmentUrl) {
++static const char *GetAttachmentPartId(const char *aAttachmentUrl) {
+   static const char partIdPrefix[] = "part=";
+-  const char* partId = PL_strstr(aAttachmentUrl, partIdPrefix);
++  const char *partId = PL_strstr(aAttachmentUrl, partIdPrefix);
+   return partId ? (partId + sizeof(partIdPrefix) - 1) : nullptr;
+ }
+ 
+-static int CompareAttachmentPartId(const char* aAttachUrlLeft,
+-                                   const char* aAttachUrlRight) {
++static int CompareAttachmentPartId(const char *aAttachUrlLeft,
++                                   const char *aAttachUrlRight) {
+   // part ids are numbers separated by periods, like "1.2.3.4".
+   // we sort by doing a numerical comparison on each item in turn. e.g. "1.4" <
+   // "1.25" shorter entries come before longer entries. e.g. "1.4" < "1.4.1.2"
+@@ -2041,8 +2153,8 @@
+   //   1  right is greater than left
+   //   2  right is a parent of left
+ 
+-  const char* partIdLeft = GetAttachmentPartId(aAttachUrlLeft);
+-  const char* partIdRight = GetAttachmentPartId(aAttachUrlRight);
++  const char *partIdLeft = GetAttachmentPartId(aAttachUrlLeft);
++  const char *partIdRight = GetAttachmentPartId(aAttachUrlRight);
+ 
+   // for detached attachments the URL does not contain any "part=xx"
+   if (!partIdLeft) partIdLeft = "0";
+@@ -2058,7 +2170,7 @@
+ 
+     // if the part numbers are different then the numerically smaller one is
+     // first
+-    char* fixConstLoss;
++    char *fixConstLoss;
+     idLeft = strtol(partIdLeft, &fixConstLoss, 10);
+     partIdLeft = fixConstLoss;
+     idRight = strtol(partIdRight, &fixConstLoss, 10);
+@@ -2085,8 +2197,8 @@
+ 
+ // struct on purpose -> show that we don't ever want a vtable
+ struct msgAttachment {
+-  msgAttachment(const nsACString& aContentType, const nsACString& aUrl,
+-                const nsACString& aDisplayName, const nsACString& aMessageUri)
++  msgAttachment(const nsACString &aContentType, const nsACString &aUrl,
++                const nsACString &aDisplayName, const nsACString &aMessageUri)
+       : mContentType(aContentType),
+         mUrl(aUrl),
+         mDisplayName(aDisplayName),
+@@ -2103,14 +2215,14 @@
+ class nsAttachmentState {
+  public:
+   nsAttachmentState();
+-  nsresult Init(const nsTArray<nsCString>& aContentTypeArray,
+-                const nsTArray<nsCString>& aUrlArray,
+-                const nsTArray<nsCString>& aDisplayNameArray,
+-                const nsTArray<nsCString>& aMessageUriArray);
++  nsresult Init(const nsTArray<nsCString> &aContentTypeArray,
++                const nsTArray<nsCString> &aUrlArray,
++                const nsTArray<nsCString> &aDisplayNameArray,
++                const nsTArray<nsCString> &aMessageUriArray);
+   nsresult PrepareForAttachmentDelete();
+ 
+  private:
+-  static int CompareAttachmentsByPartId(const void* aLeft, const void* aRight);
++  static int CompareAttachmentsByPartId(const void *aLeft, const void *aRight);
+ 
+  public:
+   uint32_t mCurIndex;
+@@ -2119,13 +2231,12 @@
+ 
+ nsAttachmentState::nsAttachmentState() : mCurIndex(0) {}
+ 
+-nsresult nsAttachmentState::Init(const nsTArray<nsCString>& aContentTypeArray,
+-                                 const nsTArray<nsCString>& aUrlArray,
+-                                 const nsTArray<nsCString>& aDisplayNameArray,
+-                                 const nsTArray<nsCString>& aMessageUriArray) {
++nsresult nsAttachmentState::Init(const nsTArray<nsCString> &aContentTypeArray,
++                                 const nsTArray<nsCString> &aUrlArray,
++                                 const nsTArray<nsCString> &aDisplayNameArray,
++                                 const nsTArray<nsCString> &aMessageUriArray) {
+   MOZ_ASSERT(aContentTypeArray.Length() > 0);
+-  MOZ_ASSERT(aContentTypeArray.Length() == aUrlArray.Length() &&
+-             aUrlArray.Length() == aDisplayNameArray.Length() &&
++  MOZ_ASSERT(aContentTypeArray.Length() == aUrlArray.Length() ==
+              aDisplayNameArray.Length() == aMessageUriArray.Length());
+ 
+   uint32_t count = aContentTypeArray.Length();
+@@ -2179,10 +2290,10 @@
+ }
+ 
+ // Static compare callback for sorting.
+-int nsAttachmentState::CompareAttachmentsByPartId(const void* aLeft,
+-                                                  const void* aRight) {
+-  msgAttachment& attachLeft = *((msgAttachment*)aLeft);
+-  msgAttachment& attachRight = *((msgAttachment*)aRight);
++int nsAttachmentState::CompareAttachmentsByPartId(const void *aLeft,
++                                                  const void *aRight) {
++  msgAttachment &attachLeft = *((msgAttachment *)aLeft);
++  msgAttachment &attachRight = *((msgAttachment *)aRight);
+   return ::CompareAttachmentPartId(attachLeft.mUrl.get(),
+                                    attachRight.mUrl.get());
+ }
+@@ -2201,13 +2312,13 @@
+ 
+  public:
+   nsDelAttachListener();
+-  nsresult StartProcessing(nsMessenger* aMessenger, nsIMsgWindow* aMsgWindow,
+-                           nsAttachmentState* aAttach, bool aSaveFirst);
++  nsresult StartProcessing(nsMessenger *aMessenger, nsIMsgWindow *aMsgWindow,
++                           nsAttachmentState *aAttach, bool aSaveFirst);
+   nsresult DeleteOriginalMessage();
+   void SelectNewMessage();
+ 
+  public:
+-  nsAttachmentState* mAttach;                // list of attachments to process
++  nsAttachmentState *mAttach;                // list of attachments to process
+   bool mSaveFirst;                           // detach (true) or delete (false)
+   nsCOMPtr<nsIFile> mMsgFile;                // temporary file (processed mail)
+   nsCOMPtr<nsIOutputStream> mMsgFileStream;  // temporary file (processed mail)
+@@ -2245,14 +2356,14 @@
+ // nsIRequestObserver
+ //
+ NS_IMETHODIMP
+-nsDelAttachListener::OnStartRequest(nsIRequest* aRequest) {
++nsDelAttachListener::OnStartRequest(nsIRequest *aRequest) {
+   // called when we start processing the StreamMessage request.
+   // This is called after OnStartRunningUrl().
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+-nsDelAttachListener::OnStopRequest(nsIRequest* aRequest, nsresult aStatusCode) {
++nsDelAttachListener::OnStopRequest(nsIRequest *aRequest, nsresult aStatusCode) {
+   // called when we have completed processing the StreamMessage request.
+   // This is called after OnStopRequest(). This means that we have now
+   // received all data of the message and we have completed processing.
+@@ -2298,8 +2409,8 @@
+ //
+ 
+ NS_IMETHODIMP
+-nsDelAttachListener::OnDataAvailable(nsIRequest* aRequest,
+-                                     nsIInputStream* aInStream,
++nsDelAttachListener::OnDataAvailable(nsIRequest *aRequest,
++                                     nsIInputStream *aInStream,
+                                      uint64_t aSrcOffset, uint32_t aCount) {
+   if (!mMsgFileStream) return NS_ERROR_NULL_POINTER;
+   return mMessageFolder->CopyDataToOutputStreamForAppend(aInStream, aCount,
+@@ -2311,7 +2422,7 @@
+ //
+ 
+ NS_IMETHODIMP
+-nsDelAttachListener::OnStartRunningUrl(nsIURI* aUrl) {
++nsDelAttachListener::OnStartRunningUrl(nsIURI *aUrl) {
+   // called when we start processing the StreamMessage request. This is
+   // called before OnStartRequest().
+   return NS_OK;
+@@ -2343,7 +2454,7 @@
+ void nsDelAttachListener::SelectNewMessage() {
+   nsCString displayUri;
+   // all attachments refer to the same message
+-  const nsCString& messageUri(mAttach->mAttachmentArray[0].mMessageUri);
++  const nsCString &messageUri(mAttach->mAttachmentArray[0].mMessageUri);
+   mMessenger->GetLastDisplayedMessageUri(displayUri);
+   if (displayUri.Equals(messageUri)) {
+     mMessageFolder->GenerateMessageURI(mNewMessageKey, displayUri);
+@@ -2357,9 +2468,9 @@
+ }
+ 
+ NS_IMETHODIMP
+-nsDelAttachListener::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
++nsDelAttachListener::OnStopRunningUrl(nsIURI *aUrl, nsresult aExitCode) {
+   nsresult rv = NS_OK;
+-  const nsCString& messageUri(mAttach->mAttachmentArray[0].mMessageUri);
++  const nsCString &messageUri(mAttach->mAttachmentArray[0].mMessageUri);
+   if (mOriginalMessage &&
+       Substring(messageUri, 0, 13).EqualsLiteral("imap-message:")) {
+     if (m_state == eUpdatingFolder) rv = DeleteOriginalMessage();
+@@ -2396,7 +2507,7 @@
+ }
+ 
+ NS_IMETHODIMP
+-nsDelAttachListener::GetMessageId(nsACString& aMessageId) {
++nsDelAttachListener::GetMessageId(nsACString &aMessageId) {
+   // never called?
+   return NS_ERROR_NOT_IMPLEMENTED;
+ }
+@@ -2420,7 +2531,7 @@
+   // update will think we need to download the header...If we do it
+   // in OnStopRunningUrl, we'll issue the delete before we do the
+   // update....all nasty stuff.
+-  const nsACString& messageUri = mAttach->mAttachmentArray[0].mMessageUri;
++  const nsACString &messageUri = mAttach->mAttachmentArray[0].mMessageUri;
+   if (mOriginalMessage &&
+       !Substring(messageUri, 0, 13).EqualsLiteral("imap-message:"))
+     return DeleteOriginalMessage();
+@@ -2454,9 +2565,9 @@
+   }
+ }
+ 
+-nsresult nsDelAttachListener::StartProcessing(nsMessenger* aMessenger,
+-                                              nsIMsgWindow* aMsgWindow,
+-                                              nsAttachmentState* aAttach,
++nsresult nsDelAttachListener::StartProcessing(nsMessenger *aMessenger,
++                                              nsIMsgWindow *aMsgWindow,
++                                              nsAttachmentState *aAttach,
+                                               bool detaching) {
+   aMessenger->QueryInterface(NS_GET_IID(nsIMessenger),
+                              getter_AddRefs(mMessenger));
+@@ -2467,7 +2578,7 @@
+   nsresult rv;
+ 
+   // all attachments refer to the same message
+-  const nsCString& messageUri = mAttach->mAttachmentArray[0].mMessageUri;
++  const nsCString &messageUri = mAttach->mAttachmentArray[0].mMessageUri;
+ 
+   // get the message service, original message and folder for this message
+   rv = GetMessageServiceFromURI(messageUri, getter_AddRefs(mMessageService));
+@@ -2505,8 +2616,8 @@
+   // create the additional header for data conversion. This will tell the stream
+   // converter which MIME emitter we want to use, and it will tell the MIME
+   // emitter which attachments should be deleted.
+-  const char* partId;
+-  const char* nextField;
++  const char *partId;
++  const char *nextField;
+   nsAutoCString sHeader("attach&del=");
+   nsAutoCString detachToHeader("&detachTo=");
+   for (uint32_t u = 0; u < mAttach->mAttachmentArray.Length(); ++u) {
+@@ -2515,10 +2626,8 @@
+       if (detaching) detachToHeader.Append(',');
+     }
+     partId = GetAttachmentPartId(mAttach->mAttachmentArray[u].mUrl.get());
+-    if (partId) {
+-      nextField = PL_strchr(partId, '&');
+-      sHeader.Append(partId, nextField ? nextField - partId : -1);
+-    }
++    nextField = PL_strchr(partId, '&');
++    sHeader.Append(partId, nextField ? nextField - partId : -1);
+     if (detaching) detachToHeader.Append(mDetachedFileUris[u]);
+   }
+ 
+@@ -2546,10 +2655,10 @@
+ // ------------------------------------
+ 
+ NS_IMETHODIMP
+-nsMessenger::DetachAttachment(const nsACString& aContentType,
+-                              const nsACString& aURL,
+-                              const nsACString& aDisplayName,
+-                              const nsACString& aMessageUri, bool aSaveFirst,
++nsMessenger::DetachAttachment(const nsACString &aContentType,
++                              const nsACString &aURL,
++                              const nsACString &aDisplayName,
++                              const nsACString &aMessageUri, bool aSaveFirst,
+                               bool withoutWarning = false) {
+   if (aSaveFirst)
+     return SaveOneAttachment(aContentType, aURL, aDisplayName, aMessageUri,
+@@ -2565,15 +2674,14 @@
+ }
+ 
+ NS_IMETHODIMP
+-nsMessenger::DetachAllAttachments(const nsTArray<nsCString>& aContentTypeArray,
+-                                  const nsTArray<nsCString>& aUrlArray,
+-                                  const nsTArray<nsCString>& aDisplayNameArray,
+-                                  const nsTArray<nsCString>& aMessageUriArray,
++nsMessenger::DetachAllAttachments(const nsTArray<nsCString> &aContentTypeArray,
++                                  const nsTArray<nsCString> &aUrlArray,
++                                  const nsTArray<nsCString> &aDisplayNameArray,
++                                  const nsTArray<nsCString> &aMessageUriArray,
+                                   bool aSaveFirst,
+                                   bool withoutWarning = false) {
+   NS_ENSURE_ARG_MIN(aContentTypeArray.Length(), 1);
+-  MOZ_ASSERT(aContentTypeArray.Length() == aUrlArray.Length() &&
+-             aUrlArray.Length() == aDisplayNameArray.Length() &&
++  MOZ_ASSERT(aContentTypeArray.Length() == aUrlArray.Length() ==
+              aDisplayNameArray.Length() == aMessageUriArray.Length());
+ 
+   if (aSaveFirst)
+@@ -2585,11 +2693,11 @@
+ }
+ 
+ nsresult nsMessenger::DetachAttachments(
+-    const nsTArray<nsCString>& aContentTypeArray,
+-    const nsTArray<nsCString>& aUrlArray,
+-    const nsTArray<nsCString>& aDisplayNameArray,
+-    const nsTArray<nsCString>& aMessageUriArray,
+-    nsTArray<nsCString>* saveFileUris, bool withoutWarning) {
++    const nsTArray<nsCString> &aContentTypeArray,
++    const nsTArray<nsCString> &aUrlArray,
++    const nsTArray<nsCString> &aDisplayNameArray,
++    const nsTArray<nsCString> &aMessageUriArray,
++    nsTArray<nsCString> *saveFileUris, bool withoutWarning) {
+   // if withoutWarning no dialog for user
+   if (!withoutWarning && NS_FAILED(PromptIfDeleteAttachments(
+                              saveFileUris != nullptr, aDisplayNameArray)))
+@@ -2638,18 +2746,16 @@
+   // messages will also be deleted. Best to display a list of them.
+ 
+   // get the listener for running the url
+-  nsDelAttachListener* listener = new nsDelAttachListener;
++  nsDelAttachListener *listener = new nsDelAttachListener;
+   if (!listener) return NS_ERROR_OUT_OF_MEMORY;
+   nsCOMPtr<nsISupports>
+       listenerSupports;  // auto-delete of the listener with error
+   listener->QueryInterface(NS_GET_IID(nsISupports),
+                            getter_AddRefs(listenerSupports));
+ 
+-  if (saveFileUris) {
+-    listener->mDetachedFileUris = saveFileUris->Clone();
+-  }
++  if (saveFileUris) listener->mDetachedFileUris = *saveFileUris;
+   // create the attachments for use by the listener
+-  nsAttachmentState* attach = new nsAttachmentState;
++  nsAttachmentState *attach = new nsAttachmentState;
+   rv = attach->Init(aContentTypeArray, aUrlArray, aDisplayNameArray,
+                     aMessageUriArray);
+   if (NS_SUCCEEDED(rv)) rv = attach->PrepareForAttachmentDelete();
+@@ -2666,7 +2772,7 @@
+ }
+ 
+ nsresult nsMessenger::PromptIfDeleteAttachments(
+-    bool aSaveFirst, const nsTArray<nsCString>& aDisplayNameArray) {
++    bool aSaveFirst, const nsTArray<nsCString> &aDisplayNameArray) {
+   nsresult rv = NS_ERROR_FAILURE;
+ 
+   nsCOMPtr<nsIPrompt> dialog(do_GetInterface(mDocShell));
+@@ -2689,7 +2795,7 @@
+ 
+   // format the message and display
+   nsString promptMessage;
+-  const char* propertyName =
++  const char *propertyName =
+       aSaveFirst ? "detachAttachments" : "deleteAttachments";
+   rv = mStringBundle->FormatStringFromName(propertyName, formatStrings,
+                                            promptMessage);
+diff --git a/package.json b/package.json
+new file mode 100644
+--- /dev/null
++++ b/package.json
+@@ -0,0 +1,7 @@
++{
++  "name": "comm",
++  "version": "1.0.0",
++  "dependencies": {
++    "python-shell": "^3.0.0"
++  }
++}
